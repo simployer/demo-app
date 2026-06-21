@@ -47,12 +47,15 @@ The LLM provider is pluggable (`LLM_PROVIDER`):
 | Local LM Studio | `lmstudio` | Set `LLM_BASE_URL=http://localhost:1234/v1` |
 | Disabled | `none` | Falls back to the count-based heuristic |
 
-If no LLM is configured, or a call fails/times out, the Coordinator falls back
-to a simple count-based heuristic (2 signals → warning/investigate, 3 →
-critical/escalate) so the system always produces a decision. The LLM call is
-synchronous inside the actor loop and is only re-run when a *new* signal type
-joins an incident — a response cache (Redis) is the documented next step if call
-volume grows.
+**The LLM call is non-blocking.** The incident opens immediately with a
+provisional count-based decision; the triage call runs on a worker thread and
+its verdict is folded back in via a `triage_result` message, so a slow model
+call delays only the *upgrade* of a decision, never the processing of new
+alerts. If no LLM is configured, or a call fails/times out, the provisional
+heuristic (2 signals → warning/investigate, 3 → critical/escalate) stands, so
+the system always produces a decision. Triage is re-run only when a *new* signal
+type joins an incident — a response cache (Redis) is the documented next step if
+call volume grows.
 
 ### Agents
 
