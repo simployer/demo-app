@@ -1,9 +1,8 @@
-"""OpenAI-compatible triage client.
+"""OpenAI-compatible client (OpenAI / Azure OpenAI / local LM Studio).
 
-Covers the non-Anthropic options listed in SIP-1765 — a local **LM Studio**
-instance, **OpenAI**, or **Azure OpenAI** — all of which speak the OpenAI
-chat-completions wire format. Implemented with plain ``requests`` to keep the
-POC dependency-light (no extra SDK).
+Implements the ``complete_json`` primitive over the OpenAI chat-completions wire
+format with plain ``requests`` (no extra SDK). ``decide`` and ``assess`` are
+inherited from ``LLMClient``.
 """
 
 from __future__ import annotations
@@ -13,15 +12,7 @@ from typing import Any
 
 import requests
 
-from .base import (
-    DECISION_SCHEMA,
-    SYSTEM_PROMPT,
-    Decision,
-    LLMClient,
-    LLMError,
-    build_decision,
-    build_user_prompt,
-)
+from .base import LLMError, LLMClient
 
 
 class OpenAICompatibleLLMClient(LLMClient):
@@ -37,28 +28,26 @@ class OpenAICompatibleLLMClient(LLMClient):
         timeout_s: float = 30.0,
         session: requests.Session | None = None,
     ):
-        # LM Studio defaults to http://localhost:1234/v1 and ignores the key;
-        # OpenAI/Azure require a real key.
         self._url = f"{base_url.rstrip('/')}/chat/completions"
-        self._model = model
+        self.model = model
         self._api_key = api_key
         self._max_tokens = max_tokens
         self._timeout_s = timeout_s
         self._session = session or requests.Session()
 
-    def decide(self, incident_context: dict[str, Any]) -> Decision:
+    def complete_json(
+        self, system: str, user: str, schema: dict[str, Any]
+    ) -> dict[str, Any]:
         body = {
-            "model": self._model,
+            "model": self.model,
             "max_tokens": self._max_tokens,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_user_prompt(incident_context)},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
-            # Ask for a JSON object constrained to our schema where supported;
-            # servers that ignore the schema still honor json_object mode.
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "incident_decision", "schema": DECISION_SCHEMA},
+                "json_schema": {"name": "obs_agents", "schema": schema},
             },
         }
         headers = {"Content-Type": "application/json"}
@@ -78,19 +67,17 @@ class OpenAICompatibleLLMClient(LLMClient):
             content = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"unexpected response shape: {exc}") from exc
-
-        return build_decision(_parse_json(content), raw=content)
+        return _parse_json(content)
 
 
 def _parse_json(text: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
+        start, end = text.find("{"), text.rfind("}")
         if start != -1 and end > start:
             try:
                 return json.loads(text[start : end + 1])
             except json.JSONDecodeError as exc:
-                raise LLMError(f"could not parse decision JSON: {exc}") from exc
+                raise LLMError(f"could not parse JSON: {exc}") from exc
         raise LLMError("response was not JSON")

@@ -3,39 +3,49 @@
 > SIP-1765 — AI-powered actor-model agent orchestration for Observability incident response (Pykka + LLM)
 
 An exploratory POC of a distributed, actor-model agent system in Python using
-[Pykka](https://pykka.readthedocs.io/). Monitoring agents watch each
-Observability signal in parallel and detect anomalies; the **Coordinator calls
-an LLM** with the correlated signal context and acts on its structured decision
-— **agents don't just alert, they reason and act**. No shared mutable state, no
-locks.
+[Pykka](https://pykka.readthedocs.io/). **All four actors are AI agents.** Each
+monitoring agent (metrics/logs/traces) reasons with an LLM over its own signal
+and reports a structured assessment up to the **Coordinator AI agent**, which
+correlates those assessments and decides the response — **agents don't just
+alert, they reason and act**. No shared mutable state, no locks.
 
 ## Architecture
 
 ```
- Prometheus ──▶ MetricsAgent ─┐
-                              │  MetricsAlert        ┌──── LLM (Claude / OpenAI / LM Studio)
- Loki ─────────▶ LogsAgent ───┼──────────────▶ CoordinatorAgent ──▶ (response agents)
-                              │  LogsAlert      │   correlate → ask LLM →
- Tempo ───────▶ TracesAgent ──┘  TracesAlert    │   decide (escalate / auto_remediate /
-                                                │   wait / investigate) → IncidentReport
-                                                └──▶ escalation / notify / remediate
+ Prometheus ─▶ Metrics AI agent ─┐  AgentAssessment   ┌─ Haiku (worker LLM)
+ Loki ───────▶ Logs AI agent ────┼──────────────▶ Coordinator AI agent ─▶ responders
+ Tempo ──────▶ Traces AI agent ──┘  (anomalous?       │   correlate assessments →
+   each: cheap threshold gate →     severity, etc.)    │   Opus decides (escalate /
+   LLM reasons → assessment                            │   auto_remediate / wait /
+                                                       │   investigate) → IncidentReport
+                                                       └─▶ escalation / notify / remediate
 ```
 
-Each agent is a Pykka `ThreadingActor` with its own inbox. The three monitoring
-agents poll their backend on an interval (default 30s, via `POLL_INTERVAL_S`),
-emit lightweight alert messages, and `tell()` them to the coordinator through
-its `ActorRef`. The coordinator is the only actor holding incident state;
-because Pykka serialises message handling per actor, that state needs no locks.
+Each agent is a Pykka `ThreadingActor` with its own inbox. The coordinator is
+the only actor holding incident state; because Pykka serialises message handling
+per actor, that state needs no locks.
 
-### AI-driven triage (the core differentiator)
+### The agents reason, not just threshold (the core differentiator)
 
-When signals from ≥2 sources correlate inside the window, the Coordinator builds
-a JSON context of the recent alerts and hands it to an LLM, which returns a
+**Monitoring agents (gated reasoning).** Each polls its backend on an interval
+(default 30s). The poll is a *cheap pre-filter* — a static threshold flags a
+candidate anomaly. Only then does the agent invoke its (fast/cheap) LLM to judge
+whether the candidate is a *genuine* problem and produce a structured
+`AgentAssessment` (`anomalous?`, confidence, severity hint, component, summary,
+reasoning). `anomalous=False` lets an agent **suppress its own false positive**.
+Gating the LLM behind the threshold keeps cost bounded — agents only think when
+there's something worth thinking about.
+
+**Coordinator AI agent.** When ≥2 sources report a genuine anomaly in-window, it
+correlates their reasoning-rich assessments and asks the (smart) LLM for a
 **structured decision**: an `action` (`escalate` / `auto_remediate` / `wait` /
-`investigate`), a `severity`, and a human-readable `analysis` + `explanation`.
-The decision is stored on the `IncidentReport` as an audit trail
-(`decision_source: "llm"`), and the Coordinator fans out to response agents when
-the action is `escalate` or `auto_remediate`.
+`investigate`), a `severity`, and a human-readable `analysis` + `explanation`,
+stored on the `IncidentReport` as an audit trail (`decision_source: "llm"`). It
+fans out to response agents on `escalate` / `auto_remediate`.
+
+**Model tiering.** Worker agents run on a fast/cheap model
+(`claude-haiku-4-5`); the coordinator runs on `claude-opus-4-8`. Both tiers fall
+back to heuristics if no LLM is configured or a call fails.
 
 The LLM provider is pluggable (`LLM_PROVIDER`):
 
@@ -59,12 +69,12 @@ call volume grows.
 
 ### Agents
 
-| Agent | Backend | Emits |
-|-------|---------|-------|
-| `MetricsAgent` | Prometheus HTTP API | `MetricsAlert` (error rate, p99 latency) |
-| `LogsAgent` | Loki LogQL | `LogsAlert` (error-level log spikes) |
-| `TracesAgent` | Tempo TraceQL | `TracesAlert` (error / slow traces) |
-| `CoordinatorAgent` | LLM | `IncidentReport` (LLM analysis, recommended action, severity, explanation) |
+| Agent | Backend | Reasons about | Emits |
+|-------|---------|---------------|-------|
+| `MetricsAgent` | Prometheus | is the error-rate/latency breach a real anomaly? | `AgentAssessment` |
+| `LogsAgent` | Loki LogQL | do these error patterns indicate a real problem? | `AgentAssessment` |
+| `TracesAgent` | Tempo TraceQL | is this latency/error pattern a real problem? | `AgentAssessment` |
+| `CoordinatorAgent` | the 3 assessments | one incident? severity + response? | `IncidentReport` |
 
 ### Messages
 
@@ -107,7 +117,8 @@ Everything is env-var driven so one image is swappable per environment.
 | `*_TOKEN` | — | bearer token (service account / AKS managed identity) |
 | `GRAFANA_URL` / `GRAFANA_TOKEN` | — | optional, for dashboard/alert updates |
 | `LLM_PROVIDER` | `anthropic` | `anthropic` / `openai` / `azure-openai` / `lmstudio` / `none` |
-| `LLM_MODEL` | `claude-opus-4-8` | model id (provider-specific) |
+| `LLM_MODEL` | `claude-opus-4-8` | coordinator (smart) model |
+| `LLM_WORKER_MODEL` | `claude-haiku-4-5` | monitoring-agent (fast/cheap) model |
 | `LLM_API_KEY` | — | provider key (Anthropic also reads `ANTHROPIC_API_KEY`) |
 | `LLM_BASE_URL` | — | required for OpenAI-compatible providers |
 | `LLM_EFFORT` | `low` | Anthropic effort: `low`/`medium`/`high`/`xhigh`/`max` |

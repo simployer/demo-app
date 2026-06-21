@@ -17,7 +17,7 @@ from .agents import CoordinatorAgent, LogsAgent, MetricsAgent, TracesAgent
 from .clients import LokiClient, PrometheusClient, TempoClient
 from .config import Config
 from .health import HealthState, start_health_server
-from .llm import LLMError, build_llm_client
+from .llm import LLMError, build_llm_client, build_worker_llm_client
 
 _log = logging.getLogger("obs_agents.main")
 
@@ -25,34 +25,33 @@ _log = logging.getLogger("obs_agents.main")
 def build_system(config: Config):
     """Construct the actor system. Returns (coordinator_ref, monitor_refs)."""
     try:
-        llm_client = build_llm_client(config.llm)
+        coord_llm = build_llm_client(config.llm)
+        worker_llm = build_worker_llm_client(config.llm)
     except LLMError as exc:
-        _log.warning("LLM client unavailable (%s); using heuristic triage", exc)
-        llm_client = None
-    if llm_client is not None:
-        _log.info("AI triage enabled via %s (%s)", llm_client.name, config.llm.model)
-    else:
-        _log.info("AI triage disabled; using count-based heuristic")
+        _log.warning("LLM clients unavailable (%s); agents use heuristics", exc)
+        coord_llm = worker_llm = None
 
-    coordinator = CoordinatorAgent.start(llm_client=llm_client)
+    if coord_llm is not None:
+        _log.info(
+            "AI agents enabled — workers: %s, coordinator: %s",
+            config.llm.worker_model, config.llm.model,
+        )
+    else:
+        _log.info("AI disabled; agents use threshold + count-based heuristics")
+
+    coordinator = CoordinatorAgent.start(llm_client=coord_llm)
 
     metrics = MetricsAgent.start(
-        coordinator,
-        PrometheusClient(config.prometheus),
-        config.thresholds,
-        config.poll_interval_s,
+        coordinator, PrometheusClient(config.prometheus),
+        config.thresholds, config.poll_interval_s, worker_llm,
     )
     logs = LogsAgent.start(
-        coordinator,
-        LokiClient(config.loki),
-        config.thresholds,
-        config.poll_interval_s,
+        coordinator, LokiClient(config.loki),
+        config.thresholds, config.poll_interval_s, worker_llm,
     )
     traces = TracesAgent.start(
-        coordinator,
-        TempoClient(config.tempo),
-        config.thresholds,
-        config.poll_interval_s,
+        coordinator, TempoClient(config.tempo),
+        config.thresholds, config.poll_interval_s, worker_llm,
     )
     return coordinator, [metrics, logs, traces]
 

@@ -1,17 +1,17 @@
-"""Coordinator Agent — AI-driven correlation and incident triage.
+"""Coordinator AI agent — correlates the monitoring agents' assessments.
 
-The coordinator is the only actor that holds incident state, and because Pykka
-serialises message handling per actor, that state needs no locks. It keeps a
-short rolling window of recent alerts; when signals from multiple sources line
-up inside the window it opens an incident and asks an LLM how to respond
-(SIP-1765 — the AI decision-making is the core differentiator).
+The monitoring agents each reason over their own signal and report an
+``AgentAssessment`` (their verdict + reasoning). The coordinator is the only
+actor that holds incident state, and because Pykka serialises message handling
+per actor, that state needs no locks. It keeps a short rolling window of recent
+assessments; when ≥2 different sources report a genuine anomaly it opens an
+incident and asks the (smart) coordinator LLM how to respond — correlating
+reasoning-rich assessments, not raw threshold alerts.
 
-**The LLM call is non-blocking.** Triage runs on a worker thread; the incident
-is opened immediately with a provisional count-based decision, and the model's
-verdict is folded back in via a ``triage_result`` message. A slow LLM call
-therefore delays the *upgrade* of a decision, never the processing of new
-alerts. Triage is re-run only when a new signal type joins an incident, which
-bounds LLM cost; a response cache (Redis) is the documented next step.
+**The coordinator LLM call is non-blocking.** The incident opens immediately with
+a provisional count-based decision; triage runs on a worker thread and its
+verdict is folded back via a ``triage_result`` message. Triage is re-run only
+when a new source joins, which bounds LLM cost.
 """
 
 from __future__ import annotations
@@ -26,28 +26,19 @@ from typing import Any, Protocol
 import pykka
 
 from ..llm import Decision, DecisionAction, LLMClient, LLMError
-from ..messages import (
-    Alert,
-    IncidentReport,
-    LogsAlert,
-    MetricsAlert,
-    Severity,
-    TracesAlert,
-)
+from ..messages import AgentAssessment, IncidentReport, Severity
 
 #: actions that warrant fanning out to response agents
 _FANOUT_ACTIONS = {DecisionAction.ESCALATE, DecisionAction.AUTO_REMEDIATE}
 
 
 class _Executor(Protocol):
-    """Minimal executor surface the coordinator needs (lets tests inject one)."""
-
     def submit(self, fn: Any, *args: Any, **kwargs: Any) -> Any: ...
     def shutdown(self, wait: bool = ...) -> None: ...
 
 
 class CoordinatorAgent(pykka.ThreadingActor):
-    """Receives alerts, correlates them, and runs async AI-driven triage."""
+    """Receives assessments, correlates them, and runs async AI triage."""
 
     name = "coordinator"
 
@@ -62,22 +53,17 @@ class CoordinatorAgent(pykka.ThreadingActor):
         self._window_s = correlation_window_s
         self._responders = responders or []
         self._llm = llm_client
-        self._recent: list[Alert] = []
+        self._recent: list[AgentAssessment] = []
         self._incidents: dict[str, IncidentReport] = {}
-        #: signal-type set the current decision is based on, per incident
         self._incident_signals: dict[str, frozenset] = {}
-        #: incidents with an in-flight async triage call
         self._pending_triage: set[str] = set()
-        #: last fan-out action per incident — dedups repeated escalations
         self._fanned_out: dict[str, DecisionAction] = {}
         self._log = logging.getLogger("obs_agents.coordinator")
 
         if triage_executor is not None:
             self._executor: _Executor | None = triage_executor
         elif llm_client is not None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="triage"
-            )
+            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="triage")
         else:
             self._executor = None
 
@@ -87,8 +73,8 @@ class CoordinatorAgent(pykka.ThreadingActor):
 
     # -- message handling ------------------------------------------------
     def on_receive(self, message: dict[str, Any]) -> Any:
-        if "alert" in message:
-            self._handle_alert(message["alert"])
+        if "assessment" in message:
+            self._handle_assessment(message["assessment"])
             return None
         if "triage_result" in message:
             self._handle_triage_result(message["triage_result"])
@@ -99,10 +85,13 @@ class CoordinatorAgent(pykka.ThreadingActor):
             return len(self._incidents)
         return None
 
-    def _handle_alert(self, alert: Alert) -> None:
-        self._log.info("coordinator received %s", type(alert).__name__)
+    def _handle_assessment(self, assessment: AgentAssessment) -> None:
+        self._log.info(
+            "coordinator received %s assessment (anomalous=%s, conf=%.2f)",
+            assessment.source, assessment.anomalous, assessment.confidence,
+        )
         self._prune()
-        self._recent.append(alert)
+        self._recent.append(assessment)
         self._correlate()
 
     # -- correlation -----------------------------------------------------
@@ -110,18 +99,17 @@ class CoordinatorAgent(pykka.ThreadingActor):
         cutoff = time.time() - self._window_s
         self._recent = [a for a in self._recent if a.timestamp >= cutoff]
 
-    def _signal_types(self) -> set[type]:
-        return {MetricsAlert, LogsAlert, TracesAlert} & {type(a) for a in self._recent}
+    def _distinct_sources(self) -> set[str]:
+        return {a.source for a in self._recent if a.anomalous}
 
     def _correlate(self) -> None:
-        distinct = self._signal_types()
+        distinct = self._distinct_sources()
         if not distinct:
             return
 
         components = self._affected_components()
-        contributing = tuple(type(a).__name__ for a in self._recent)
+        contributing = tuple(sorted(distinct))
 
-        # Update an already-open incident.
         if self._incidents:
             incident_id = next(iter(self._incidents))
             self._incidents[incident_id] = replace(
@@ -130,32 +118,24 @@ class CoordinatorAgent(pykka.ThreadingActor):
                 contributing_alerts=contributing,
                 updated_at=time.time(),
             )
-            # Re-triage only when a new signal type joins the correlation.
             if frozenset(distinct) != self._incident_signals.get(incident_id):
                 self._retriage(incident_id, distinct)
             return
 
-        # Open a new incident only once at least two signals correlate.
         if len(distinct) < 2:
             return
         self._open_incident(distinct, components, contributing)
 
     def _open_incident(
-        self,
-        distinct: set[type],
-        components: tuple[str, ...],
-        contributing: tuple[str, ...],
+        self, distinct: set[str], components: tuple[str, ...], contributing: tuple[str, ...]
     ) -> None:
         incident_id = uuid.uuid4().hex[:12]
         provisional = self._heuristic_decision(distinct)
-        report = _build_report(
-            incident_id, provisional, "heuristic", components, contributing
-        )
+        report = _build_report(incident_id, provisional, "heuristic", components, contributing)
         self._incidents[incident_id] = report
         self._incident_signals[incident_id] = frozenset(distinct)
 
         if self._llm is not None:
-            # Open provisionally now; the LLM upgrades the decision async.
             self._log.warning(
                 "opened incident %s (provisional %s); awaiting LLM triage",
                 incident_id, report.severity.value,
@@ -164,47 +144,41 @@ class CoordinatorAgent(pykka.ThreadingActor):
         else:
             self._log.warning(
                 "opened incident %s (heuristic/%s) action=%s: %s",
-                incident_id, report.severity.value,
-                report.recommended_action, report.summary,
+                incident_id, report.severity.value, report.recommended_action, report.summary,
             )
             self._maybe_fan_out(report, provisional.action)
 
-    def _retriage(self, incident_id: str, distinct: set[type]) -> None:
+    def _retriage(self, incident_id: str, distinct: set[str]) -> None:
         self._incident_signals[incident_id] = frozenset(distinct)
         if self._llm is not None:
             self._submit_triage(incident_id)
             return
-        # No LLM — recompute the heuristic synchronously.
         decision = self._heuristic_decision(distinct)
         existing = self._incidents[incident_id]
         report = _build_report(
             incident_id, decision, "heuristic",
-            existing.components, existing.contributing_alerts,
-            opened_at=existing.opened_at,
+            existing.components, existing.contributing_alerts, opened_at=existing.opened_at,
         )
         self._incidents[incident_id] = report
         self._maybe_fan_out(report, decision.action)
 
     # -- async triage ----------------------------------------------------
     def _submit_triage(self, incident_id: str) -> None:
-        """Dispatch the LLM call to a worker thread (non-blocking)."""
         if self._llm is None or self._executor is None:
             return
         if incident_id in self._pending_triage:
             return
         self._pending_triage.add(incident_id)
-        # Snapshot the context on the actor thread; the worker only reads it.
         context = self._build_context()
         self._executor.submit(self._run_triage, incident_id, context)
 
     def _run_triage(self, incident_id: str, context: dict[str, Any]) -> None:
-        """Runs on a worker thread. Folds the result back as a message."""
         try:
             decision = self._llm.decide(context)  # type: ignore[union-attr]
             result: dict[str, Any] = {"incident_id": incident_id, "decision": decision}
         except LLMError as exc:
             result = {"incident_id": incident_id, "error": str(exc)}
-        except Exception as exc:  # noqa: BLE001 - never lose the worker silently
+        except Exception as exc:  # noqa: BLE001
             result = {"incident_id": incident_id, "error": repr(exc)}
         try:
             self.actor_ref.tell({"triage_result": result})
@@ -216,8 +190,7 @@ class CoordinatorAgent(pykka.ThreadingActor):
         self._pending_triage.discard(incident_id)
         existing = self._incidents.get(incident_id)
         if existing is None:
-            return  # incident gone (e.g. resolved) before triage returned
-
+            return
         if "error" in result:
             self._log.warning(
                 "async LLM triage failed for %s (%s); keeping heuristic",
@@ -225,12 +198,10 @@ class CoordinatorAgent(pykka.ThreadingActor):
             )
             self._maybe_fan_out(existing, DecisionAction(existing.recommended_action))
             return
-
         decision: Decision = result["decision"]
         report = _build_report(
             incident_id, decision, "llm",
-            existing.components, existing.contributing_alerts,
-            opened_at=existing.opened_at,
+            existing.components, existing.contributing_alerts, opened_at=existing.opened_at,
         )
         self._incidents[incident_id] = report
         self._log.warning(
@@ -240,9 +211,8 @@ class CoordinatorAgent(pykka.ThreadingActor):
         self._maybe_fan_out(report, decision.action)
 
     # -- heuristic fallback ---------------------------------------------
-    def _heuristic_decision(self, distinct: set[type]) -> Decision:
-        """Count-based decision: provisional, and the fallback when no LLM."""
-        names = ", ".join(sorted(t.__name__.replace("Alert", "").lower() for t in distinct))
+    def _heuristic_decision(self, distinct: set[str]) -> Decision:
+        names = ", ".join(sorted(distinct))
         if len(distinct) >= 3:
             severity, action = Severity.CRITICAL, DecisionAction.ESCALATE
         elif len(distinct) == 2:
@@ -253,37 +223,30 @@ class CoordinatorAgent(pykka.ThreadingActor):
             action=action,
             severity=severity,
             summary=f"correlated anomalies across {names}",
-            analysis=f"{len(distinct)} independent signal type(s) correlated in-window.",
+            analysis=f"{len(distinct)} agent(s) reported a genuine anomaly in-window.",
             explanation=(
-                f"Heuristic triage: {len(distinct)} signals agree → {severity.value}. "
+                f"Heuristic triage: {len(distinct)} agents agree → {severity.value}. "
                 f"Recommended action: {action.value}."
             ),
         )
 
     def _build_context(self) -> dict[str, Any]:
         return {
-            "alerts": [a.to_dict() for a in self._recent],
+            "assessments": [a.to_dict() for a in self._recent if a.anomalous],
             "affected_components": list(self._affected_components()),
-            "signal_types": sorted(t.__name__ for t in self._signal_types()),
+            "signal_sources": sorted(self._distinct_sources()),
             "correlation_window_seconds": self._window_s,
         }
 
     def _affected_components(self) -> tuple[str, ...]:
-        components: set[str] = set()
-        for alert in self._recent:
-            if isinstance(alert, MetricsAlert) and alert.component:
-                components.add(alert.component)
-            elif isinstance(alert, TracesAlert) and alert.service:
-                components.add(alert.service)
-        return tuple(sorted(components))
+        return tuple(sorted({a.component for a in self._recent if a.anomalous and a.component}))
 
     # -- fan-out ---------------------------------------------------------
     def _maybe_fan_out(self, report: IncidentReport, action: DecisionAction) -> None:
-        """Forward to response agents, deduping repeated identical actions."""
         if action not in _FANOUT_ACTIONS:
             return
         if self._fanned_out.get(report.incident_id) == action:
-            return  # already escalated/remediated this incident with this action
+            return
         self._fanned_out[report.incident_id] = action
         for responder in self._responders:
             try:

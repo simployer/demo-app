@@ -62,7 +62,8 @@ class LLMConfig:
     """
 
     provider: str = "anthropic"
-    model: str = "claude-opus-4-8"
+    model: str = "claude-opus-4-8"  # coordinator (smart) model
+    worker_model: str = "claude-haiku-4-5"  # monitoring agents (fast/cheap)
     api_key: str | None = None
     base_url: str | None = None
     max_tokens: int = 4096
@@ -72,13 +73,14 @@ class LLMConfig:
     @classmethod
     def from_env(cls) -> "LLMConfig":
         provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
-        # Sensible default model per provider family.
-        default_model = (
-            "claude-opus-4-8" if provider == "anthropic" else "gpt-4o-mini"
-        )
+        anthropic = provider == "anthropic"
+        # Sensible default models per provider family and tier.
+        default_model = "claude-opus-4-8" if anthropic else "gpt-4o"
+        default_worker = "claude-haiku-4-5" if anthropic else "gpt-4o-mini"
         return cls(
             provider=provider,
             model=os.getenv("LLM_MODEL", default_model),
+            worker_model=os.getenv("LLM_WORKER_MODEL", default_worker),
             api_key=os.getenv("LLM_API_KEY"),
             base_url=os.getenv("LLM_BASE_URL"),
             max_tokens=_env_int("LLM_MAX_TOKENS", 4096),

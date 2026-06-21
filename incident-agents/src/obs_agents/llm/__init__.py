@@ -7,7 +7,7 @@ covers local LM Studio, OpenAI, and Azure OpenAI per SIP-1765.
 """
 
 from .base import Decision, DecisionAction, LLMClient, LLMError
-from .factory import build_llm_client
+from .factory import build_llm_client, build_worker_llm_client
 
 __all__ = [
     "Decision",
@@ -15,4 +15,5 @@ __all__ = [
     "LLMClient",
     "LLMError",
     "build_llm_client",
+    "build_worker_llm_client",
 ]

@@ -77,6 +77,34 @@ class TracesAlert(Alert):
 
 
 @dataclass(frozen=True)
+class AgentAssessment:
+    """A monitoring AI agent's reasoned verdict on its own signal.
+
+    Each worker agent (metrics/logs/traces) cheaply pre-filters for a candidate
+    anomaly, then asks its LLM to judge whether it's a *genuine* problem and
+    reports this assessment up to the Coordinator — which correlates the
+    assessments rather than raw threshold alerts. ``anomalous=False`` lets an
+    agent suppress its own false positive.
+    """
+
+    source: str
+    anomalous: bool
+    confidence: float
+    severity_hint: Severity
+    summary: str
+    analysis: str
+    component: str = ""
+    evidence: tuple[str, ...] = ()
+    assessed_by: str = "heuristic"  # "llm:<model>" | "heuristic"
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["severity_hint"] = self.severity_hint.value
+        return data
+
+
+@dataclass(frozen=True)
 class IncidentReport:
     """Correlated incident produced by the Coordinator.
 

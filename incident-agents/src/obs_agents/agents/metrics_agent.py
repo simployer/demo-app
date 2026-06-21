@@ -31,8 +31,9 @@ class MetricsAgent(MonitorAgent):
         client: PrometheusClient,
         thresholds: Thresholds,
         poll_interval_s: float,
+        llm_client=None,
     ):
-        super().__init__(coordinator, poll_interval_s)
+        super().__init__(coordinator, poll_interval_s, llm_client)
         self._client = client
         self._thresholds = thresholds
 

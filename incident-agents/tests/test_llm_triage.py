@@ -1,10 +1,4 @@
-"""AI-driven triage: the Coordinator acts on the LLM's structured decision.
-
-Triage is dispatched to a worker thread in production. These tests inject an
-*inline* executor so the async ``triage_result`` message is enqueued
-synchronously and ordering is deterministic; ``test_triage_is_non_blocking``
-exercises the real thread-pool path.
-"""
+"""Coordinator AI triage acts on the LLM's structured decision (async)."""
 
 import time
 
@@ -14,12 +8,10 @@ import pytest
 from obs_agents.agents import CoordinatorAgent
 from obs_agents.llm import Decision, DecisionAction, LLMClient, LLMError
 from obs_agents.llm.base import build_decision
-from obs_agents.messages import LogsAlert, MetricsAlert, Severity
+from obs_agents.messages import AgentAssessment, Severity
 
 
 class _InlineExecutor:
-    """Runs the submitted callable immediately on the calling thread."""
-
     def submit(self, fn, *args, **kwargs):
         fn(*args, **kwargs)
 
@@ -28,7 +20,7 @@ class _InlineExecutor:
 
 
 class _FakeLLM(LLMClient):
-    """Records the context it was given and returns a canned decision."""
+    """Returns a canned decision; records the context passed to decide()."""
 
     name = "fake"
 
@@ -52,9 +44,16 @@ class _BrokenLLM(LLMClient):
 
 
 def _coordinator(llm, **kwargs):
-    """Start a coordinator with inline (synchronous) triage by default."""
     kwargs.setdefault("triage_executor", _InlineExecutor())
     return CoordinatorAgent.start(llm_client=llm, **kwargs)
+
+
+def _assess(source, component=""):
+    return AgentAssessment(
+        source=source, anomalous=True, confidence=0.9,
+        severity_hint=Severity.WARNING, summary=f"{source} anomaly",
+        analysis="reasoned", component=component,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -77,8 +76,8 @@ def test_decision_drives_incident_fields():
     llm = _FakeLLM(_critical())
     coordinator = _coordinator(llm)
 
-    coordinator.ask({"alert": MetricsAlert(threshold_name="error_rate", component="http")}, timeout=2)
-    coordinator.ask({"alert": LogsAlert(error_pattern="db timeout", match_count=50)}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
 
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert len(incidents) == 1
@@ -87,8 +86,8 @@ def test_decision_drives_incident_fields():
     assert inc["severity"] == "critical"
     assert inc["recommended_action"] == "escalate"
     assert inc["explanation"].startswith("Page the on-call")
-    # The model received the correlated alert context.
-    assert llm.calls and "alerts" in llm.calls[0]
+    # The coordinator received the agents' assessments as correlation context.
+    assert llm.calls and "assessments" in llm.calls[0]
 
 
 def test_llm_decision_fans_out_on_escalate():
@@ -101,8 +100,8 @@ def test_llm_decision_fans_out_on_escalate():
     responder = Responder.start()
     coordinator = _coordinator(_FakeLLM(_critical()), responders=[responder])
 
-    coordinator.ask({"alert": MetricsAlert(threshold_name="error_rate", component="http")}, timeout=2)
-    coordinator.ask({"alert": LogsAlert(error_pattern="db timeout")}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
     coordinator.ask({"query": "incidents"}, timeout=2)
     assert any("incident" in m for m in received)
 
@@ -116,16 +115,14 @@ def test_wait_decision_does_not_fan_out():
 
     responder = Responder.start()
     wait_decision = Decision(
-        action=DecisionAction.WAIT,
-        severity=Severity.INFO,
-        summary="likely transient",
-        analysis="single brief blip",
+        action=DecisionAction.WAIT, severity=Severity.INFO,
+        summary="likely transient", analysis="single brief blip",
         explanation="Keep watching; no action needed.",
     )
     coordinator = _coordinator(_FakeLLM(wait_decision), responders=[responder])
 
-    coordinator.ask({"alert": MetricsAlert(threshold_name="error_rate", component="http")}, timeout=2)
-    coordinator.ask({"alert": LogsAlert(error_pattern="blip")}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert incidents[0]["recommended_action"] == "wait"
     assert received == []
@@ -133,31 +130,24 @@ def test_wait_decision_does_not_fan_out():
 
 def test_falls_back_to_heuristic_on_llm_error():
     coordinator = _coordinator(_BrokenLLM())
-    coordinator.ask({"alert": MetricsAlert(threshold_name="error_rate", component="http")}, timeout=2)
-    coordinator.ask({"alert": LogsAlert(error_pattern="boom")}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert incidents[0]["decision_source"] == "heuristic"
 
 
 def test_triage_is_non_blocking():
-    """A slow LLM call must not stall the coordinator inbox.
-
-    Uses the real thread-pool executor: the incident is visible (provisionally,
-    via the heuristic) while the LLM call is still in flight, then upgraded to
-    the LLM decision once it returns.
-    """
+    """A slow coordinator LLM call must not stall the inbox."""
     llm = _FakeLLM(_critical(), delay_s=0.4)
-    coordinator = CoordinatorAgent.start(llm_client=llm)  # default ThreadPoolExecutor
+    coordinator = CoordinatorAgent.start(llm_client=llm)  # real ThreadPoolExecutor
     try:
-        coordinator.ask({"alert": MetricsAlert(threshold_name="error_rate", component="http")}, timeout=2)
-        coordinator.ask({"alert": LogsAlert(error_pattern="db timeout")}, timeout=2)
+        coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
+        coordinator.ask({"assessment": _assess("logs")}, timeout=2)
 
-        # Query returns immediately even though the LLM call is still sleeping.
         early = coordinator.ask({"query": "incidents"}, timeout=1)
         assert len(early) == 1
         assert early[0]["decision_source"] == "heuristic"  # provisional
 
-        # The LLM decision is folded in once the worker completes.
         deadline = time.time() + 2.0
         source = early[0]["decision_source"]
         while source != "llm" and time.time() < deadline:
