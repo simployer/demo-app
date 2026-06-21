@@ -26,6 +26,7 @@ from typing import Any, Protocol
 
 import pykka
 
+from ..cache import DecisionCache, NoopCache
 from ..llm import Decision, DecisionAction, LLMClient, LLMError
 from ..messages import AgentAssessment, IncidentReport, Severity
 from ..status import StatusBoard
@@ -52,12 +53,14 @@ class CoordinatorAgent(pykka.ThreadingActor):
         triage_executor: _Executor | None = None,
         status_board: StatusBoard | None = None,
         tools: Any = None,
+        decision_cache: DecisionCache | None = None,
     ):
         super().__init__()
         self._window_s = correlation_window_s
         self._responders = responders or []
         self._llm = llm_client
         self._tools = tools
+        self._cache = decision_cache or NoopCache()
         self._board = status_board
         self._recent: list[AgentAssessment] = []
         #: incidents keyed by entity (affected service/component)
@@ -213,11 +216,19 @@ class CoordinatorAgent(pykka.ThreadingActor):
 
     def _run_triage(self, entity: str, context: dict[str, Any]) -> None:
         try:
-            if self._tools is not None:
-                decision = self._llm.decide_with_tools(context, self._tools)  # type: ignore[union-attr]
+            cached = self._cache.get(context)
+            if cached is not None:
+                # Recurring shape — reuse the prior verdict, skip the LLM.
+                result: dict[str, Any] = {
+                    "entity": entity, "decision": cached, "source": "cache",
+                }
             else:
-                decision = self._llm.decide(context)  # type: ignore[union-attr]
-            result: dict[str, Any] = {"entity": entity, "decision": decision}
+                if self._tools is not None:
+                    decision = self._llm.decide_with_tools(context, self._tools)  # type: ignore[union-attr]
+                else:
+                    decision = self._llm.decide(context)  # type: ignore[union-attr]
+                self._cache.set(context, decision)
+                result = {"entity": entity, "decision": decision, "source": "llm"}
         except LLMError as exc:
             result = {"entity": entity, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001
@@ -241,16 +252,19 @@ class CoordinatorAgent(pykka.ThreadingActor):
             self._maybe_fan_out(existing, DecisionAction(existing.recommended_action))
             return
         decision: Decision = result["decision"]
+        source = result.get("source", "llm")
         report = _build_report(
-            entity, decision, "llm",
+            entity, decision, source,
             existing.components, existing.contributing_alerts, opened_at=existing.opened_at,
         )
         self._incidents[entity] = report
         self._log.warning(
-            "incident on %s triaged by LLM: action=%s severity=%s",
-            entity, decision.action.value, decision.severity.value,
+            "incident on %s triaged (%s): action=%s severity=%s",
+            entity, source, decision.action.value, decision.severity.value,
         )
-        self._publish("decided", f"{entity}: {decision.action.value} ({decision.severity.value})")
+        self._publish(
+            "decided", f"{entity}: {decision.action.value} ({decision.severity.value}, {source})"
+        )
         self._maybe_fan_out(report, decision.action)
 
     # -- heuristic fallback ---------------------------------------------

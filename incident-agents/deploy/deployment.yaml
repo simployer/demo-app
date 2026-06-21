@@ -47,6 +47,12 @@ spec:
               value: high                    # coordinator: agentic tool-use reasoning
             - name: LLM_WORKER_EFFORT
               value: low
+            # Optional decision cache — reuses triage verdicts for recurring
+            # patterns. Omit REDIS_URL to disable.
+            - name: REDIS_URL
+              value: redis://redis.monitoring:6379/0
+            - name: CACHE_TTL_S
+              value: "300"
             - name: LLM_API_KEY
               valueFrom:
                 secretKeyRef: { name: obs-agents, key: llm-api-key }

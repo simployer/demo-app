@@ -14,6 +14,7 @@ import threading
 import pykka
 
 from .agents import CoordinatorAgent, LogsAgent, MetricsAgent, TracesAgent
+from .cache import build_decision_cache
 from .clients import LokiClient, PrometheusClient, TempoClient
 from .config import Config
 from .health import HealthState, start_health_server
@@ -56,7 +57,8 @@ def build_system(config: Config, board: StatusBoard | None = None):
         _log.info("AI disabled; agents use threshold + count-based heuristics")
 
     coordinator = CoordinatorAgent.start(
-        llm_client=coord_llm, status_board=board, tools=tools
+        llm_client=coord_llm, status_board=board, tools=tools,
+        decision_cache=build_decision_cache(config),
     )
 
     metrics = MetricsAgent.start(

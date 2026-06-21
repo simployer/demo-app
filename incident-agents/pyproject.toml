@@ -14,8 +14,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cache = [
+    "redis>=5.0",
+]
 dev = [
     "pytest==8.3.3",
+    "redis>=5.0",
 ]
 
 [project.scripts]

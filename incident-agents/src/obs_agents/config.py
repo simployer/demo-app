@@ -104,6 +104,10 @@ class Config:
     thresholds: Thresholds = field(default_factory=Thresholds)
     llm: LLMConfig = field(default_factory=LLMConfig)
 
+    # Optional Redis decision cache (no-op when redis_url is unset).
+    redis_url: str | None = None
+    cache_ttl_s: float = 300.0
+
     health_host: str = "0.0.0.0"
     health_port: int = 8080
     log_level: str = "INFO"
@@ -141,6 +145,8 @@ class Config:
                 max_error_traces=_env_int("THRESHOLD_ERROR_TRACES", 5),
             ),
             llm=LLMConfig.from_env(),
+            redis_url=os.getenv("REDIS_URL"),
+            cache_ttl_s=_env_float("CACHE_TTL_S", 300.0),
             health_host=os.getenv("HEALTH_HOST", "0.0.0.0"),
             health_port=_env_int("HEALTH_PORT", 8080),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

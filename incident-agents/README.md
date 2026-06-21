@@ -68,6 +68,16 @@ worker thread, so the investigation never stalls the coordinator's inbox.
 effort `high` for the harder, tool-using reasoning. Both tiers fall back to
 heuristics if no LLM is configured or a call fails.
 
+**Decision cache (optional).** The agentic triage is the priciest call in the
+system, so an optional Redis cache (`REDIS_URL`) stores each decision keyed by
+the incident's *shape* (entity + signal sources + severity hints). A recurring
+pattern — e.g. a flaky service firing the same correlation repeatedly, or the
+same pattern after a restart/across pods — reuses the prior verdict
+(`decision_source: "cache"`) instead of re-paying the Opus + tool-use loop.
+Entirely optional: unset `REDIS_URL` (or an unreachable Redis) degrades to a
+no-op, and cache failures never break triage. Install with `pip install -e
+".[cache]"`.
+
 The LLM provider is pluggable (`LLM_PROVIDER`):
 
 | Provider | `LLM_PROVIDER` | Notes |
@@ -157,6 +167,8 @@ Everything is env-var driven so one image is swappable per environment.
 | `LLM_MAX_INVESTIGATION_STEPS` | `4` | coordinator tool-use iterations per incident |
 | `LLM_MAX_TOKENS` | `8192` | coordinator max output tokens (tools + thinking) |
 | `LLM_TIMEOUT_S` | `45` | per-call timeout (agentic loop may take several) |
+| `REDIS_URL` | — | enable the decision cache (e.g. `redis://redis:6379/0`); unset = no-op |
+| `CACHE_TTL_S` | `300` | cached-decision TTL |
 | `POLL_INTERVAL_S` | `30` | monitoring poll cadence |
 | `THRESHOLD_ERROR_RATE` | `0.05` | metrics: max error fraction |
 | `THRESHOLD_P99_LATENCY_MS` | `750` | metrics: max p99 latency |
