@@ -24,6 +24,7 @@ import requests
 
 from ..llm import LLMClient, LLMError
 from ..messages import AgentAssessment, Alert, Severity
+from ..status import StatusBoard
 
 
 class MonitorAgent(pykka.ThreadingActor):
@@ -37,15 +38,26 @@ class MonitorAgent(pykka.ThreadingActor):
         coordinator: pykka.ActorRef,
         poll_interval_s: float,
         llm_client: LLMClient | None = None,
+        status_board: StatusBoard | None = None,
     ):
         super().__init__()
         self._coordinator = coordinator
         self._poll_interval_s = poll_interval_s
         self._llm = llm_client
+        self._board = status_board
         self._timer: threading.Timer | None = None
         self._log = logging.getLogger(f"obs_agents.{self.name}")
         #: set True only after at least one successful poll — feeds readiness
         self.healthy = False
+
+    # -- status board ----------------------------------------------------
+    def _set_state(self, state: str, detail: str = "") -> None:
+        if self._board is not None:
+            self._board.set_state(self.actor_urn, state, detail)
+
+    def _bump(self, **deltas: int) -> None:
+        if self._board is not None:
+            self._board.bump(self.actor_urn, **deltas)
 
     # -- Pykka lifecycle -------------------------------------------------
     def on_start(self) -> None:
@@ -53,11 +65,15 @@ class MonitorAgent(pykka.ThreadingActor):
             "%s agent starting (interval=%ss, reasoning=%s)",
             self.name, self._poll_interval_s, "llm" if self._llm else "heuristic",
         )
+        if self._board is not None:
+            self._board.register(self.actor_urn, self.name, self.name)
         self.actor_ref.tell({"poll": True})
 
     def on_stop(self) -> None:
         if self._timer is not None:
             self._timer.cancel()
+        if self._board is not None:
+            self._board.unregister(self.actor_urn)
 
     def on_receive(self, message: dict[str, Any]) -> None:
         if message.get("poll"):
@@ -80,28 +96,46 @@ class MonitorAgent(pykka.ThreadingActor):
             pass
 
     def _safe_poll(self) -> None:
+        self._set_state("polling")
         try:
             candidates = self.poll()  # cheap threshold pre-filter
             self.healthy = True
         except requests.RequestException as exc:
             self.healthy = False
             self._log.warning("%s poll failed: %s", self.name, exc)
+            self._set_state("error", str(exc)[:60])
+            self._bump(poll_errors=1)
             return
-        except Exception:  # noqa: BLE001 - POC: never let a poll kill the actor
+        except Exception as exc:  # noqa: BLE001 - never let a poll kill the actor
             self.healthy = False
             self._log.exception("%s poll failed unexpectedly", self.name)
+            self._set_state("error", str(exc)[:60])
+            self._bump(poll_errors=1)
             return
 
+        self._bump(polls=1)
         if not candidates:
+            self._set_state("idle", "no anomalies")
             return
+
+        self._set_state(
+            "reasoning" if self._llm else "checking",
+            f"{len(candidates)} candidate(s)",
+        )
         assessment = self._assess(candidates)
         if assessment.anomalous:
+            self._set_state(
+                "reporting", f"{assessment.severity_hint.value}: {assessment.summary[:50]}"
+            )
+            self._bump(reported=1)
             self._coordinator.tell({"assessment": assessment})
         else:
             self._log.info(
                 "%s suppressed candidate (not anomalous): %s",
                 self.name, assessment.summary,
             )
+            self._set_state("suppressed", assessment.summary[:50])
+            self._bump(suppressed=1)
 
     # -- reasoning (gated) -----------------------------------------------
     def _assess(self, candidates: list[Alert]) -> AgentAssessment:

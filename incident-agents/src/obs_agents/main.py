@@ -18,11 +18,12 @@ from .clients import LokiClient, PrometheusClient, TempoClient
 from .config import Config
 from .health import HealthState, start_health_server
 from .llm import LLMError, build_llm_client, build_worker_llm_client
+from .status import StatusBoard
 
 _log = logging.getLogger("obs_agents.main")
 
 
-def build_system(config: Config):
+def build_system(config: Config, board: StatusBoard | None = None):
     """Construct the actor system. Returns (coordinator_ref, monitor_refs)."""
     try:
         coord_llm = build_llm_client(config.llm)
@@ -39,19 +40,19 @@ def build_system(config: Config):
     else:
         _log.info("AI disabled; agents use threshold + count-based heuristics")
 
-    coordinator = CoordinatorAgent.start(llm_client=coord_llm)
+    coordinator = CoordinatorAgent.start(llm_client=coord_llm, status_board=board)
 
     metrics = MetricsAgent.start(
         coordinator, PrometheusClient(config.prometheus),
-        config.thresholds, config.poll_interval_s, worker_llm,
+        config.thresholds, config.poll_interval_s, worker_llm, board,
     )
     logs = LogsAgent.start(
         coordinator, LokiClient(config.loki),
-        config.thresholds, config.poll_interval_s, worker_llm,
+        config.thresholds, config.poll_interval_s, worker_llm, board,
     )
     traces = TracesAgent.start(
         coordinator, TempoClient(config.tempo),
-        config.thresholds, config.poll_interval_s, worker_llm,
+        config.thresholds, config.poll_interval_s, worker_llm, board,
     )
     return coordinator, [metrics, logs, traces]
 
@@ -64,14 +65,18 @@ def main() -> None:
     )
     log = logging.getLogger("obs_agents.main")
 
-    coordinator, monitors = build_system(config)
+    board = StatusBoard()
+    coordinator, monitors = build_system(config, board)
     shutdown_health = start_health_server(
         config.health_host,
         config.health_port,
-        HealthState(monitors, coordinator),
+        HealthState(monitors, coordinator, board),
     )
 
-    log.info("incident-response agent system started")
+    log.info(
+        "incident-response agent system started — dashboard at http://%s:%s/",
+        config.health_host, config.health_port,
+    )
 
     stop_event = threading.Event()
 

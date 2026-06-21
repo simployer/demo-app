@@ -113,8 +113,18 @@ export TEMPO_URL=http://localhost:3200
 obs-agents
 ```
 
-Health endpoints come up on `:8080`:
+Then open the **live dashboard** at `http://localhost:8080/` — an
+auto-refreshing view of every agent with a symbol for what it's doing
+(🔍 polling, 🧠 reasoning, 🚨 reporting, 🤫 suppressed, 💤 idle; coordinator
+🧩 correlating / 🔥 incident / ✅ decided) plus open incidents. It refreshes
+every second and discovers agents dynamically, so newly spawned agents appear on
+their own. Run with a short `POLL_INTERVAL_S` (e.g. `2`) to watch the activity
+flow.
 
+HTTP endpoints on `:8080`:
+
+- `GET /` — live HTML dashboard
+- `GET /status` — JSON snapshot of every agent + open incidents (drives the dashboard)
 - `GET /healthz` — liveness (process + coordinator alive)
 - `GET /readyz` — readiness (every monitor has polled successfully)
 - `GET /incidents` — current open incidents

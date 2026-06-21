@@ -32,8 +32,9 @@ class MetricsAgent(MonitorAgent):
         thresholds: Thresholds,
         poll_interval_s: float,
         llm_client=None,
+        status_board=None,
     ):
-        super().__init__(coordinator, poll_interval_s, llm_client)
+        super().__init__(coordinator, poll_interval_s, llm_client, status_board)
         self._client = client
         self._thresholds = thresholds
 

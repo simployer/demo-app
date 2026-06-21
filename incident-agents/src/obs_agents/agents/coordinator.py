@@ -28,6 +28,7 @@ import pykka
 
 from ..llm import Decision, DecisionAction, LLMClient, LLMError
 from ..messages import AgentAssessment, IncidentReport, Severity
+from ..status import StatusBoard
 
 _FANOUT_ACTIONS = {DecisionAction.ESCALATE, DecisionAction.AUTO_REMEDIATE}
 _UNSCOPED = "unknown"  # entity bucket for assessments with no identifiable component
@@ -49,11 +50,13 @@ class CoordinatorAgent(pykka.ThreadingActor):
         responders: list[pykka.ActorRef] | None = None,
         llm_client: LLMClient | None = None,
         triage_executor: _Executor | None = None,
+        status_board: StatusBoard | None = None,
     ):
         super().__init__()
         self._window_s = correlation_window_s
         self._responders = responders or []
         self._llm = llm_client
+        self._board = status_board
         self._recent: list[AgentAssessment] = []
         #: incidents keyed by entity (affected service/component)
         self._incidents: dict[str, IncidentReport] = {}
@@ -69,9 +72,21 @@ class CoordinatorAgent(pykka.ThreadingActor):
         else:
             self._executor = None
 
+    def on_start(self) -> None:
+        if self._board is not None:
+            self._board.register(self.actor_urn, "coordinator", "coordinator")
+            self._board.set_state(self.actor_urn, "idle", "awaiting assessments")
+
     def on_stop(self) -> None:
         if isinstance(self._executor, ThreadPoolExecutor):
             self._executor.shutdown(wait=False)
+        if self._board is not None:
+            self._board.unregister(self.actor_urn)
+
+    def _publish(self, state: str, detail: str = "") -> None:
+        if self._board is not None:
+            self._board.set_state(self.actor_urn, state, detail)
+            self._board.set_counter(self.actor_urn, open_incidents=len(self._incidents))
 
     # -- message handling ------------------------------------------------
     def on_receive(self, message: dict[str, Any]) -> Any:
@@ -94,6 +109,9 @@ class CoordinatorAgent(pykka.ThreadingActor):
         )
         self._prune()
         self._recent.append(assessment)
+        self._publish(
+            "correlating", f"{assessment.source} → {assessment.component or _UNSCOPED}"
+        )
         self._correlate()
 
     # -- topological grouping --------------------------------------------
@@ -153,6 +171,7 @@ class CoordinatorAgent(pykka.ThreadingActor):
         self._incidents[entity] = report
         self._incident_signals[entity] = frozenset(sources)
 
+        self._publish("incident", f"opened {entity} ({report.severity.value})")
         if self._llm is not None:
             self._log.warning(
                 "opened incident on %s (provisional %s); awaiting LLM triage",
@@ -226,6 +245,7 @@ class CoordinatorAgent(pykka.ThreadingActor):
             "incident on %s triaged by LLM: action=%s severity=%s",
             entity, decision.action.value, decision.severity.value,
         )
+        self._publish("decided", f"{entity}: {decision.action.value} ({decision.severity.value})")
         self._maybe_fan_out(report, decision.action)
 
     # -- heuristic fallback ---------------------------------------------
