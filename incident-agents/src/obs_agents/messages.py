@@ -78,13 +78,22 @@ class TracesAlert(Alert):
 
 @dataclass(frozen=True)
 class IncidentReport:
-    """Correlated incident produced by the Coordinator."""
+    """Correlated incident produced by the Coordinator.
+
+    Carries the LLM-generated analysis and recommended action when AI triage is
+    enabled (SIP-1765); ``decision_source`` records whether the verdict came
+    from the model or the fallback heuristic, for the audit trail.
+    """
 
     incident_id: str
     severity: Severity
     summary: str
     components: tuple[str, ...]
     contributing_alerts: tuple[str, ...]
+    recommended_action: str = "investigate"
+    analysis: str = ""
+    explanation: str = ""
+    decision_source: str = "heuristic"  # "llm" | "heuristic"
     opened_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 

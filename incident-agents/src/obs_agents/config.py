@@ -52,6 +52,42 @@ class Thresholds:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    """AI-triage provider config.
+
+    The Coordinator calls an LLM with correlated signals and acts on its
+    decision (SIP-1765). Provider is pluggable: ``anthropic`` (default), or an
+    OpenAI-compatible endpoint (``openai`` / ``azure-openai`` / ``lmstudio``).
+    Set ``LLM_PROVIDER=none`` to disable and fall back to the heuristic.
+    """
+
+    provider: str = "anthropic"
+    model: str = "claude-opus-4-8"
+    api_key: str | None = None
+    base_url: str | None = None
+    max_tokens: int = 4096
+    effort: str = "low"  # anthropic only: low | medium | high | xhigh | max
+    timeout_s: float = 30.0
+
+    @classmethod
+    def from_env(cls) -> "LLMConfig":
+        provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+        # Sensible default model per provider family.
+        default_model = (
+            "claude-opus-4-8" if provider == "anthropic" else "gpt-4o-mini"
+        )
+        return cls(
+            provider=provider,
+            model=os.getenv("LLM_MODEL", default_model),
+            api_key=os.getenv("LLM_API_KEY"),
+            base_url=os.getenv("LLM_BASE_URL"),
+            max_tokens=_env_int("LLM_MAX_TOKENS", 4096),
+            effort=os.getenv("LLM_EFFORT", "low"),
+            timeout_s=_env_float("LLM_TIMEOUT_S", 30.0),
+        )
+
+
+@dataclass(frozen=True)
 class Config:
     prometheus: EndpointConfig
     loki: EndpointConfig
@@ -60,6 +96,7 @@ class Config:
 
     poll_interval_s: float = 30.0
     thresholds: Thresholds = field(default_factory=Thresholds)
+    llm: LLMConfig = field(default_factory=LLMConfig)
 
     health_host: str = "0.0.0.0"
     health_port: int = 8080
@@ -97,6 +134,7 @@ class Config:
                 max_trace_p99_ms=_env_float("THRESHOLD_TRACE_P99_MS", 1000.0),
                 max_error_traces=_env_int("THRESHOLD_ERROR_TRACES", 5),
             ),
+            llm=LLMConfig.from_env(),
             health_host=os.getenv("HEALTH_HOST", "0.0.0.0"),
             health_port=_env_int("HEALTH_PORT", 8080),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

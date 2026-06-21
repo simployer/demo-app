@@ -36,6 +36,19 @@ spec:
               value: "30"
             - name: LOG_LEVEL
               value: INFO
+            # --- AI triage (SIP-1765) ---
+            - name: LLM_PROVIDER
+              value: anthropic          # or openai / azure-openai / lmstudio / none
+            - name: LLM_MODEL
+              value: claude-opus-4-8
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef: { name: obs-agents, key: llm-api-key }
+            # For a local/in-cluster LM Studio instead, drop LLM_API_KEY and set:
+            # - name: LLM_PROVIDER
+            #   value: lmstudio
+            # - name: LLM_BASE_URL
+            #   value: http://lmstudio.ml:1234/v1
             # Tokens via service account / AKS managed identity, e.g.:
             # - name: PROMETHEUS_TOKEN
             #   valueFrom:

@@ -17,11 +17,24 @@ from .agents import CoordinatorAgent, LogsAgent, MetricsAgent, TracesAgent
 from .clients import LokiClient, PrometheusClient, TempoClient
 from .config import Config
 from .health import HealthState, start_health_server
+from .llm import LLMError, build_llm_client
+
+_log = logging.getLogger("obs_agents.main")
 
 
 def build_system(config: Config):
     """Construct the actor system. Returns (coordinator_ref, monitor_refs)."""
-    coordinator = CoordinatorAgent.start()
+    try:
+        llm_client = build_llm_client(config.llm)
+    except LLMError as exc:
+        _log.warning("LLM client unavailable (%s); using heuristic triage", exc)
+        llm_client = None
+    if llm_client is not None:
+        _log.info("AI triage enabled via %s (%s)", llm_client.name, config.llm.model)
+    else:
+        _log.info("AI triage disabled; using count-based heuristic")
+
+    coordinator = CoordinatorAgent.start(llm_client=llm_client)
 
     metrics = MetricsAgent.start(
         coordinator,

@@ -1,4 +1,8 @@
-"""Coordinator correlation behaviour."""
+"""Coordinator correlation + triage behaviour.
+
+These run with no LLM client, exercising the count-based heuristic fallback.
+LLM-driven triage is covered in test_llm_triage.py with a fake client.
+"""
 
 import pykka
 import pytest
@@ -30,6 +34,8 @@ def test_two_signals_open_warning_incident(coordinator):
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert len(incidents) == 1
     assert incidents[0]["severity"] == "warning"
+    assert incidents[0]["decision_source"] == "heuristic"
+    assert incidents[0]["recommended_action"] == "investigate"
     assert "http" in incidents[0]["components"]
 
 
@@ -41,9 +47,10 @@ def test_three_signals_escalate_to_critical(coordinator):
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert len(incidents) == 1
     assert incidents[0]["severity"] == "critical"
+    assert incidents[0]["recommended_action"] == "escalate"
 
 
-def test_fan_out_to_responder():
+def test_escalation_fans_out_to_responder():
     received = []
 
     class Responder(pykka.ThreadingActor):
@@ -53,9 +60,10 @@ def test_fan_out_to_responder():
     responder = Responder.start()
     coordinator = CoordinatorAgent.start(responders=[responder])
     try:
+        # Three signals → heuristic CRITICAL/escalate → fan out.
         coordinator.ask({"alert": MetricsAlert(threshold_name="error_rate", component="http")}, timeout=2)
         coordinator.ask({"alert": LogsAlert(error_pattern="boom")}, timeout=2)
-        # give the tell() time to land
+        coordinator.ask({"alert": TracesAlert(service="api", error_trace_count=10)}, timeout=2)
         incidents = coordinator.ask({"query": "incidents"}, timeout=2)
         assert len(incidents) == 1
         assert any("incident" in m for m in received)
