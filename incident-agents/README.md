@@ -36,12 +36,24 @@ reasoning). `anomalous=False` lets an agent **suppress its own false positive**.
 Gating the LLM behind the threshold keeps cost bounded — agents only think when
 there's something worth thinking about.
 
-**Coordinator AI agent.** When ≥2 sources report a genuine anomaly in-window, it
-correlates their reasoning-rich assessments and asks the (smart) LLM for a
-**structured decision**: an `action` (`escalate` / `auto_remediate` / `wait` /
-`investigate`), a `severity`, and a human-readable `analysis` + `explanation`,
-stored on the `IncidentReport` as an audit trail (`decision_source: "llm"`). It
-fans out to response agents on `escalate` / `auto_remediate`.
+**Coordinator AI agent — topological correlation.** Recent anomalous
+assessments are grouped **by the entity they implicate** (affected
+service/component, with trace-id linking), not by mere co-occurrence in a time
+window. An incident opens **per entity** once ≥2 distinct sources implicate the
+*same* one — so unrelated anomalies (latency on `checkout`, errors on `search`)
+no longer merge into a single incident, and same-service signals across
+metrics/logs/traces do. Each incident is keyed by its entity (multiple
+concurrent incidents are supported). For each, the coordinator asks the (smart)
+LLM for a **structured decision**: an `action` (`escalate` / `auto_remediate` /
+`wait` / `investigate`), a `severity`, and a human-readable `analysis` +
+`explanation`, stored on the `IncidentReport` (`decision_source: "llm"`). It fans
+out to response agents on `escalate` / `auto_remediate`.
+
+> Topological correlation is only as good as the entity labels the agents emit:
+> two agents must name the same service consistently for their signals to
+> correlate. Production-izing this means normalizing service names from backend
+> labels; trace-id linking (already wired) is the stronger join when traces and
+> logs share trace context.
 
 **Model tiering.** Worker agents run on a fast/cheap model
 (`claude-haiku-4-5`); the coordinator runs on `claude-opus-4-8`. Both tiers fall

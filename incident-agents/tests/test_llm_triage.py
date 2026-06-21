@@ -48,7 +48,7 @@ def _coordinator(llm, **kwargs):
     return CoordinatorAgent.start(llm_client=llm, **kwargs)
 
 
-def _assess(source, component=""):
+def _assess(source, component="checkout"):
     return AgentAssessment(
         source=source, anomalous=True, confidence=0.9,
         severity_hint=Severity.WARNING, summary=f"{source} anomaly",
@@ -76,8 +76,8 @@ def test_decision_drives_incident_fields():
     llm = _FakeLLM(_critical())
     coordinator = _coordinator(llm)
 
-    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
-    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "checkout")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs", "checkout")}, timeout=2)
 
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert len(incidents) == 1
@@ -100,8 +100,8 @@ def test_llm_decision_fans_out_on_escalate():
     responder = Responder.start()
     coordinator = _coordinator(_FakeLLM(_critical()), responders=[responder])
 
-    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
-    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "checkout")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs", "checkout")}, timeout=2)
     coordinator.ask({"query": "incidents"}, timeout=2)
     assert any("incident" in m for m in received)
 
@@ -121,8 +121,8 @@ def test_wait_decision_does_not_fan_out():
     )
     coordinator = _coordinator(_FakeLLM(wait_decision), responders=[responder])
 
-    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
-    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "checkout")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs", "checkout")}, timeout=2)
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert incidents[0]["recommended_action"] == "wait"
     assert received == []
@@ -130,8 +130,8 @@ def test_wait_decision_does_not_fan_out():
 
 def test_falls_back_to_heuristic_on_llm_error():
     coordinator = _coordinator(_BrokenLLM())
-    coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
-    coordinator.ask({"assessment": _assess("logs")}, timeout=2)
+    coordinator.ask({"assessment": _assess("metrics", "checkout")}, timeout=2)
+    coordinator.ask({"assessment": _assess("logs", "checkout")}, timeout=2)
     incidents = coordinator.ask({"query": "incidents"}, timeout=2)
     assert incidents[0]["decision_source"] == "heuristic"
 
@@ -141,8 +141,8 @@ def test_triage_is_non_blocking():
     llm = _FakeLLM(_critical(), delay_s=0.4)
     coordinator = CoordinatorAgent.start(llm_client=llm)  # real ThreadPoolExecutor
     try:
-        coordinator.ask({"assessment": _assess("metrics", "http")}, timeout=2)
-        coordinator.ask({"assessment": _assess("logs")}, timeout=2)
+        coordinator.ask({"assessment": _assess("metrics", "checkout")}, timeout=2)
+        coordinator.ask({"assessment": _assess("logs", "checkout")}, timeout=2)
 
         early = coordinator.ask({"query": "incidents"}, timeout=1)
         assert len(early) == 1

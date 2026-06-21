@@ -1,24 +1,25 @@
-"""Coordinator AI agent — correlates the monitoring agents' assessments.
+"""Coordinator AI agent — topological correlation of agent assessments.
 
 The monitoring agents each reason over their own signal and report an
-``AgentAssessment`` (their verdict + reasoning). The coordinator is the only
-actor that holds incident state, and because Pykka serialises message handling
-per actor, that state needs no locks. It keeps a short rolling window of recent
-assessments; when ≥2 different sources report a genuine anomaly it opens an
-incident and asks the (smart) coordinator LLM how to respond — correlating
-reasoning-rich assessments, not raw threshold alerts.
+``AgentAssessment`` (verdict + reasoning + the entity it implicates). The
+coordinator groups recent anomalous assessments **by entity** — the affected
+service/component, with trace-id linking — rather than by mere co-occurrence in
+a time window. An incident opens per entity once ≥2 distinct sources implicate
+the *same* entity, so unrelated anomalies (latency on `checkout`, errors on
+`search`) no longer merge into one incident, and same-service signals across
+metrics/logs/traces do.
 
-**The coordinator LLM call is non-blocking.** The incident opens immediately with
-a provisional count-based decision; triage runs on a worker thread and its
-verdict is folded back via a ``triage_result`` message. Triage is re-run only
-when a new source joins, which bounds LLM cost.
+State is lock-free: Pykka serialises message handling per actor. The coordinator
+LLM call is non-blocking (provisional heuristic now, LLM verdict folded back via
+``triage_result``). Triage re-runs only when a new source joins an entity.
 """
 
 from __future__ import annotations
 
 import logging
+import string
 import time
-import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any, Protocol
@@ -28,8 +29,8 @@ import pykka
 from ..llm import Decision, DecisionAction, LLMClient, LLMError
 from ..messages import AgentAssessment, IncidentReport, Severity
 
-#: actions that warrant fanning out to response agents
 _FANOUT_ACTIONS = {DecisionAction.ESCALATE, DecisionAction.AUTO_REMEDIATE}
+_UNSCOPED = "unknown"  # entity bucket for assessments with no identifiable component
 
 
 class _Executor(Protocol):
@@ -38,7 +39,7 @@ class _Executor(Protocol):
 
 
 class CoordinatorAgent(pykka.ThreadingActor):
-    """Receives assessments, correlates them, and runs async AI triage."""
+    """Correlates assessments by entity and runs async AI triage per incident."""
 
     name = "coordinator"
 
@@ -54,6 +55,7 @@ class CoordinatorAgent(pykka.ThreadingActor):
         self._responders = responders or []
         self._llm = llm_client
         self._recent: list[AgentAssessment] = []
+        #: incidents keyed by entity (affected service/component)
         self._incidents: dict[str, IncidentReport] = {}
         self._incident_signals: dict[str, frozenset] = {}
         self._pending_triage: set[str] = set()
@@ -87,159 +89,173 @@ class CoordinatorAgent(pykka.ThreadingActor):
 
     def _handle_assessment(self, assessment: AgentAssessment) -> None:
         self._log.info(
-            "coordinator received %s assessment (anomalous=%s, conf=%.2f)",
-            assessment.source, assessment.anomalous, assessment.confidence,
+            "coordinator received %s assessment (entity=%s, anomalous=%s)",
+            assessment.source, assessment.component or _UNSCOPED, assessment.anomalous,
         )
         self._prune()
         self._recent.append(assessment)
         self._correlate()
 
-    # -- correlation -----------------------------------------------------
+    # -- topological grouping --------------------------------------------
     def _prune(self) -> None:
         cutoff = time.time() - self._window_s
         self._recent = [a for a in self._recent if a.timestamp >= cutoff]
 
-    def _distinct_sources(self) -> set[str]:
-        return {a.source for a in self._recent if a.anomalous}
+    def _groups(self) -> dict[str, list[AgentAssessment]]:
+        """Group recent anomalous assessments by the entity they implicate."""
+        anomalous = [a for a in self._recent if a.anomalous]
+        # Map trace ids → entity from assessments that carry both, so an
+        # unscoped assessment sharing a trace can inherit the entity.
+        trace_entity: dict[str, str] = {}
+        for a in anomalous:
+            if a.component:
+                for tok in a.evidence:
+                    if _is_trace_id(tok):
+                        trace_entity.setdefault(tok, a.component)
+
+        groups: dict[str, list[AgentAssessment]] = defaultdict(list)
+        for a in anomalous:
+            entity = a.component
+            if not entity:
+                entity = next(
+                    (trace_entity[tok] for tok in a.evidence if tok in trace_entity),
+                    _UNSCOPED,
+                )
+            groups[entity].append(a)
+        return groups
 
     def _correlate(self) -> None:
-        distinct = self._distinct_sources()
-        if not distinct:
-            return
+        for entity, group in self._groups().items():
+            sources = {a.source for a in group}
+            if len(sources) < 2:
+                continue  # not enough distinct sources implicating this entity
+            contributing = tuple(sorted(sources))
+            components = (entity,)
 
-        components = self._affected_components()
-        contributing = tuple(sorted(distinct))
-
-        if self._incidents:
-            incident_id = next(iter(self._incidents))
-            self._incidents[incident_id] = replace(
-                self._incidents[incident_id],
-                components=components,
-                contributing_alerts=contributing,
-                updated_at=time.time(),
-            )
-            if frozenset(distinct) != self._incident_signals.get(incident_id):
-                self._retriage(incident_id, distinct)
-            return
-
-        if len(distinct) < 2:
-            return
-        self._open_incident(distinct, components, contributing)
+            if entity in self._incidents:
+                self._incidents[entity] = replace(
+                    self._incidents[entity],
+                    components=components,
+                    contributing_alerts=contributing,
+                    updated_at=time.time(),
+                )
+                if frozenset(sources) != self._incident_signals.get(entity):
+                    self._retriage(entity, sources)
+            else:
+                self._open_incident(entity, sources, components, contributing)
 
     def _open_incident(
-        self, distinct: set[str], components: tuple[str, ...], contributing: tuple[str, ...]
+        self, entity: str, sources: set[str],
+        components: tuple[str, ...], contributing: tuple[str, ...],
     ) -> None:
-        incident_id = uuid.uuid4().hex[:12]
-        provisional = self._heuristic_decision(distinct)
-        report = _build_report(incident_id, provisional, "heuristic", components, contributing)
-        self._incidents[incident_id] = report
-        self._incident_signals[incident_id] = frozenset(distinct)
+        provisional = self._heuristic_decision(entity, sources)
+        report = _build_report(entity, provisional, "heuristic", components, contributing)
+        self._incidents[entity] = report
+        self._incident_signals[entity] = frozenset(sources)
 
         if self._llm is not None:
             self._log.warning(
-                "opened incident %s (provisional %s); awaiting LLM triage",
-                incident_id, report.severity.value,
+                "opened incident on %s (provisional %s); awaiting LLM triage",
+                entity, report.severity.value,
             )
-            self._submit_triage(incident_id)
+            self._submit_triage(entity)
         else:
             self._log.warning(
-                "opened incident %s (heuristic/%s) action=%s: %s",
-                incident_id, report.severity.value, report.recommended_action, report.summary,
+                "opened incident on %s (heuristic/%s) action=%s",
+                entity, report.severity.value, report.recommended_action,
             )
             self._maybe_fan_out(report, provisional.action)
 
-    def _retriage(self, incident_id: str, distinct: set[str]) -> None:
-        self._incident_signals[incident_id] = frozenset(distinct)
+    def _retriage(self, entity: str, sources: set[str]) -> None:
+        self._incident_signals[entity] = frozenset(sources)
         if self._llm is not None:
-            self._submit_triage(incident_id)
+            self._submit_triage(entity)
             return
-        decision = self._heuristic_decision(distinct)
-        existing = self._incidents[incident_id]
+        decision = self._heuristic_decision(entity, sources)
+        existing = self._incidents[entity]
         report = _build_report(
-            incident_id, decision, "heuristic",
+            entity, decision, "heuristic",
             existing.components, existing.contributing_alerts, opened_at=existing.opened_at,
         )
-        self._incidents[incident_id] = report
+        self._incidents[entity] = report
         self._maybe_fan_out(report, decision.action)
 
     # -- async triage ----------------------------------------------------
-    def _submit_triage(self, incident_id: str) -> None:
+    def _submit_triage(self, entity: str) -> None:
         if self._llm is None or self._executor is None:
             return
-        if incident_id in self._pending_triage:
+        if entity in self._pending_triage:
             return
-        self._pending_triage.add(incident_id)
-        context = self._build_context()
-        self._executor.submit(self._run_triage, incident_id, context)
+        self._pending_triage.add(entity)
+        context = self._context_for(entity)
+        self._executor.submit(self._run_triage, entity, context)
 
-    def _run_triage(self, incident_id: str, context: dict[str, Any]) -> None:
+    def _run_triage(self, entity: str, context: dict[str, Any]) -> None:
         try:
             decision = self._llm.decide(context)  # type: ignore[union-attr]
-            result: dict[str, Any] = {"incident_id": incident_id, "decision": decision}
+            result: dict[str, Any] = {"entity": entity, "decision": decision}
         except LLMError as exc:
-            result = {"incident_id": incident_id, "error": str(exc)}
+            result = {"entity": entity, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001
-            result = {"incident_id": incident_id, "error": repr(exc)}
+            result = {"entity": entity, "error": repr(exc)}
         try:
             self.actor_ref.tell({"triage_result": result})
         except pykka.ActorDeadError:
             pass
 
     def _handle_triage_result(self, result: dict[str, Any]) -> None:
-        incident_id = result["incident_id"]
-        self._pending_triage.discard(incident_id)
-        existing = self._incidents.get(incident_id)
+        entity = result["entity"]
+        self._pending_triage.discard(entity)
+        existing = self._incidents.get(entity)
         if existing is None:
             return
         if "error" in result:
             self._log.warning(
                 "async LLM triage failed for %s (%s); keeping heuristic",
-                incident_id, result["error"],
+                entity, result["error"],
             )
             self._maybe_fan_out(existing, DecisionAction(existing.recommended_action))
             return
         decision: Decision = result["decision"]
         report = _build_report(
-            incident_id, decision, "llm",
+            entity, decision, "llm",
             existing.components, existing.contributing_alerts, opened_at=existing.opened_at,
         )
-        self._incidents[incident_id] = report
+        self._incidents[entity] = report
         self._log.warning(
-            "incident %s triaged by LLM: action=%s severity=%s",
-            incident_id, decision.action.value, decision.severity.value,
+            "incident on %s triaged by LLM: action=%s severity=%s",
+            entity, decision.action.value, decision.severity.value,
         )
         self._maybe_fan_out(report, decision.action)
 
     # -- heuristic fallback ---------------------------------------------
-    def _heuristic_decision(self, distinct: set[str]) -> Decision:
-        names = ", ".join(sorted(distinct))
-        if len(distinct) >= 3:
+    def _heuristic_decision(self, entity: str, sources: set[str]) -> Decision:
+        names = ", ".join(sorted(sources))
+        if len(sources) >= 3:
             severity, action = Severity.CRITICAL, DecisionAction.ESCALATE
-        elif len(distinct) == 2:
+        elif len(sources) == 2:
             severity, action = Severity.WARNING, DecisionAction.INVESTIGATE
         else:
             severity, action = Severity.INFO, DecisionAction.WAIT
         return Decision(
             action=action,
             severity=severity,
-            summary=f"correlated anomalies across {names}",
-            analysis=f"{len(distinct)} agent(s) reported a genuine anomaly in-window.",
+            summary=f"correlated anomalies on {entity} across {names}",
+            analysis=f"{len(sources)} agents implicate {entity} in-window.",
             explanation=(
-                f"Heuristic triage: {len(distinct)} agents agree → {severity.value}. "
-                f"Recommended action: {action.value}."
+                f"Heuristic triage: {len(sources)} agents agree on {entity} → "
+                f"{severity.value}. Recommended action: {action.value}."
             ),
         )
 
-    def _build_context(self) -> dict[str, Any]:
+    def _context_for(self, entity: str) -> dict[str, Any]:
+        group = self._groups().get(entity, [])
         return {
-            "assessments": [a.to_dict() for a in self._recent if a.anomalous],
-            "affected_components": list(self._affected_components()),
-            "signal_sources": sorted(self._distinct_sources()),
+            "entity": entity,
+            "assessments": [a.to_dict() for a in group],
+            "signal_sources": sorted({a.source for a in group}),
             "correlation_window_seconds": self._window_s,
         }
-
-    def _affected_components(self) -> tuple[str, ...]:
-        return tuple(sorted({a.component for a in self._recent if a.anomalous and a.component}))
 
     # -- fan-out ---------------------------------------------------------
     def _maybe_fan_out(self, report: IncidentReport, action: DecisionAction) -> None:
@@ -255,8 +271,13 @@ class CoordinatorAgent(pykka.ThreadingActor):
                 self._log.warning("responder %s is dead", responder)
 
 
+def _is_trace_id(token: str) -> bool:
+    """Heuristic: a hex string ≥16 chars looks like a trace id."""
+    return len(token) >= 16 and all(c in string.hexdigits for c in token)
+
+
 def _build_report(
-    incident_id: str,
+    entity: str,
     decision: Decision,
     source: str,
     components: tuple[str, ...],
@@ -266,7 +287,7 @@ def _build_report(
 ) -> IncidentReport:
     now = time.time()
     return IncidentReport(
-        incident_id=incident_id,
+        incident_id=entity,
         severity=decision.severity,
         summary=decision.summary,
         components=components,
