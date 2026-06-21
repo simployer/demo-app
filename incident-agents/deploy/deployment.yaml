@@ -1,0 +1,66 @@
+# Sample AKS Deployment for the incident-response agent system.
+# Swap the image tag / endpoints per environment (ArgoCD overlay or values).
+#
+# Use a StatefulSet instead if incident state must survive pod restarts; for
+# this POC in-memory state is fine and a Deployment keeps it simple.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: obs-agents
+  labels:
+    app: obs-agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: obs-agents
+  template:
+    metadata:
+      labels:
+        app: obs-agents
+    spec:
+      containers:
+        - name: obs-agents
+          image: simployertechdev.azurecr.io/obs-agents:latest
+          ports:
+            - name: health
+              containerPort: 8080
+          env:
+            - name: PROMETHEUS_URL
+              value: http://prometheus-operated.monitoring:9090
+            - name: LOKI_URL
+              value: http://loki-gateway.monitoring:3100
+            - name: TEMPO_URL
+              value: http://tempo.monitoring:3200
+            - name: POLL_INTERVAL_S
+              value: "30"
+            - name: LOG_LEVEL
+              value: INFO
+            # Tokens via service account / AKS managed identity, e.g.:
+            # - name: PROMETHEUS_TOKEN
+            #   valueFrom:
+            #     secretKeyRef: { name: obs-agents, key: prometheus-token }
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
