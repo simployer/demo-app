@@ -51,11 +51,13 @@ class CoordinatorAgent(pykka.ThreadingActor):
         llm_client: LLMClient | None = None,
         triage_executor: _Executor | None = None,
         status_board: StatusBoard | None = None,
+        tools: Any = None,
     ):
         super().__init__()
         self._window_s = correlation_window_s
         self._responders = responders or []
         self._llm = llm_client
+        self._tools = tools
         self._board = status_board
         self._recent: list[AgentAssessment] = []
         #: incidents keyed by entity (affected service/component)
@@ -211,7 +213,10 @@ class CoordinatorAgent(pykka.ThreadingActor):
 
     def _run_triage(self, entity: str, context: dict[str, Any]) -> None:
         try:
-            decision = self._llm.decide(context)  # type: ignore[union-attr]
+            if self._tools is not None:
+                decision = self._llm.decide_with_tools(context, self._tools)  # type: ignore[union-attr]
+            else:
+                decision = self._llm.decide(context)  # type: ignore[union-attr]
             result: dict[str, Any] = {"entity": entity, "decision": decision}
         except LLMError as exc:
             result = {"entity": entity, "error": str(exc)}

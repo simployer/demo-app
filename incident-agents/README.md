@@ -55,9 +55,18 @@ out to response agents on `escalate` / `auto_remediate`.
 > labels; trace-id linking (already wired) is the stronger join when traces and
 > logs share trace context.
 
-**Model tiering.** Worker agents run on a fast/cheap model
-(`claude-haiku-4-5`); the coordinator runs on `claude-opus-4-8`. Both tiers fall
-back to heuristics if no LLM is configured or a call fails.
+**Agentic investigation.** The coordinator isn't a one-shot classifier — it's
+given read-only tools (`get_service_logs`, `get_service_traces`, `run_promql`)
+and runs a short tool-use loop: it pulls *more* evidence on demand for the
+affected service before deciding, instead of guessing from the assessment
+summaries. Tool results are size-capped, and the loop is bounded by
+`LLM_MAX_INVESTIGATION_STEPS` (default 4). This runs on the non-blocking triage
+worker thread, so the investigation never stalls the coordinator's inbox.
+
+**Model + effort tiering.** Worker agents run on a fast/cheap model
+(`claude-haiku-4-5`, effort `low`); the coordinator runs on `claude-opus-4-8` at
+effort `high` for the harder, tool-using reasoning. Both tiers fall back to
+heuristics if no LLM is configured or a call fails.
 
 The LLM provider is pluggable (`LLM_PROVIDER`):
 
@@ -143,9 +152,11 @@ Everything is env-var driven so one image is swappable per environment.
 | `LLM_WORKER_MODEL` | `claude-haiku-4-5` | monitoring-agent (fast/cheap) model |
 | `LLM_API_KEY` | — | provider key (Anthropic also reads `ANTHROPIC_API_KEY`) |
 | `LLM_BASE_URL` | — | required for OpenAI-compatible providers |
-| `LLM_EFFORT` | `low` | Anthropic effort: `low`/`medium`/`high`/`xhigh`/`max` |
-| `LLM_MAX_TOKENS` | `4096` | max output tokens for the triage call |
-| `LLM_TIMEOUT_S` | `30` | per-call timeout |
+| `LLM_EFFORT` | `high` | coordinator effort: `low`/`medium`/`high`/`xhigh`/`max` |
+| `LLM_WORKER_EFFORT` | `low` | monitoring-agent effort |
+| `LLM_MAX_INVESTIGATION_STEPS` | `4` | coordinator tool-use iterations per incident |
+| `LLM_MAX_TOKENS` | `8192` | coordinator max output tokens (tools + thinking) |
+| `LLM_TIMEOUT_S` | `45` | per-call timeout (agentic loop may take several) |
 | `POLL_INTERVAL_S` | `30` | monitoring poll cadence |
 | `THRESHOLD_ERROR_RATE` | `0.05` | metrics: max error fraction |
 | `THRESHOLD_P99_LATENCY_MS` | `750` | metrics: max p99 latency |

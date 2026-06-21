@@ -16,7 +16,12 @@ def _disabled(config: LLMConfig | None) -> bool:
 
 
 def build_llm_client(
-    config: LLMConfig | None, *, model: str | None = None, max_tokens: int | None = None
+    config: LLMConfig | None,
+    *,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    effort: str | None = None,
+    max_steps: int | None = None,
 ) -> LLMClient | None:
     """Construct an ``LLMClient`` for ``config``, optionally overriding the model.
 
@@ -36,8 +41,9 @@ def build_llm_client(
             api_key=config.api_key,
             base_url=config.base_url,
             max_tokens=max_tokens or config.max_tokens,
-            effort=config.effort,
+            effort=effort or config.effort,
             timeout_s=config.timeout_s,
+            max_steps=max_steps if max_steps is not None else config.max_investigation_steps,
         )
 
     if provider in ("openai", "azure-openai", "lmstudio", "openai-compatible"):
@@ -57,8 +63,10 @@ def build_llm_client(
 
 
 def build_worker_llm_client(config: LLMConfig | None) -> LLMClient | None:
-    """Build the shared worker-tier client (cheaper model, smaller token cap)."""
+    """Build the shared worker-tier client (cheaper model, low effort)."""
     if _disabled(config):
         return None
     assert config is not None
-    return build_llm_client(config, model=config.worker_model, max_tokens=1024)
+    return build_llm_client(
+        config, model=config.worker_model, max_tokens=1024, effort=config.worker_effort
+    )

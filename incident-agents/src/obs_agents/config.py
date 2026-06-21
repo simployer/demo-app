@@ -66,9 +66,11 @@ class LLMConfig:
     worker_model: str = "claude-haiku-4-5"  # monitoring agents (fast/cheap)
     api_key: str | None = None
     base_url: str | None = None
-    max_tokens: int = 4096
-    effort: str = "low"  # anthropic only: low | medium | high | xhigh | max
-    timeout_s: float = 30.0
+    max_tokens: int = 8192  # coordinator headroom for tool-use + thinking
+    effort: str = "high"  # coordinator effort (anthropic): low|medium|high|xhigh|max
+    worker_effort: str = "low"  # monitoring agents — fast/cheap
+    timeout_s: float = 45.0  # agentic loop may run several round-trips
+    max_investigation_steps: int = 4  # tool-use iterations the coordinator may take
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
@@ -83,9 +85,11 @@ class LLMConfig:
             worker_model=os.getenv("LLM_WORKER_MODEL", default_worker),
             api_key=os.getenv("LLM_API_KEY"),
             base_url=os.getenv("LLM_BASE_URL"),
-            max_tokens=_env_int("LLM_MAX_TOKENS", 4096),
-            effort=os.getenv("LLM_EFFORT", "low"),
-            timeout_s=_env_float("LLM_TIMEOUT_S", 30.0),
+            max_tokens=_env_int("LLM_MAX_TOKENS", 8192),
+            effort=os.getenv("LLM_EFFORT", "high"),
+            worker_effort=os.getenv("LLM_WORKER_EFFORT", "low"),
+            timeout_s=_env_float("LLM_TIMEOUT_S", 45.0),
+            max_investigation_steps=_env_int("LLM_MAX_INVESTIGATION_STEPS", 4),
         )
 
 

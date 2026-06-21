@@ -43,6 +43,10 @@ spec:
               value: claude-opus-4-8        # coordinator (smart)
             - name: LLM_WORKER_MODEL
               value: claude-haiku-4-5        # monitoring agents (fast/cheap)
+            - name: LLM_EFFORT
+              value: high                    # coordinator: agentic tool-use reasoning
+            - name: LLM_WORKER_EFFORT
+              value: low
             - name: LLM_API_KEY
               valueFrom:
                 secretKeyRef: { name: obs-agents, key: llm-api-key }

@@ -41,7 +41,7 @@ class TracesAgent(MonitorAgent):
                 TracesAlert(
                     service="unknown",
                     error_trace_count=len(error_ids),
-                    sample_trace_ids=tuple(error_ids[:5]),
+                    sample_trace_ids=tuple(error_ids[:8]),
                 )
             )
 
@@ -52,7 +52,7 @@ class TracesAgent(MonitorAgent):
                 TracesAlert(
                     service="unknown",
                     p99_latency_ms=self._thresholds.max_trace_p99_ms,
-                    sample_trace_ids=tuple(slow_ids[:5]),
+                    sample_trace_ids=tuple(slow_ids[:8]),
                 )
             )
 

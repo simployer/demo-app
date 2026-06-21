@@ -47,7 +47,9 @@ class LogsAgent(MonitorAgent):
         if total <= self._thresholds.max_error_log_rate:
             return []
 
-        samples = self._client.sample_lines(ERROR_SAMPLE_QUERY, lookback_s=300.0)
+        samples = self._client.sample_lines(
+            ERROR_SAMPLE_QUERY, lookback_s=300.0, max_lines=12
+        )
         return [
             LogsAlert(
                 error_pattern="level=~error|critical",

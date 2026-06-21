@@ -8,12 +8,14 @@ covers local LM Studio, OpenAI, and Azure OpenAI per SIP-1765.
 
 from .base import Decision, DecisionAction, LLMClient, LLMError
 from .factory import build_llm_client, build_worker_llm_client
+from .tools import InvestigationTools
 
 __all__ = [
     "Decision",
     "DecisionAction",
     "LLMClient",
     "LLMError",
+    "InvestigationTools",
     "build_llm_client",
     "build_worker_llm_client",
 ]

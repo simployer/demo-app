@@ -17,7 +17,12 @@ from .agents import CoordinatorAgent, LogsAgent, MetricsAgent, TracesAgent
 from .clients import LokiClient, PrometheusClient, TempoClient
 from .config import Config
 from .health import HealthState, start_health_server
-from .llm import LLMError, build_llm_client, build_worker_llm_client
+from .llm import (
+    InvestigationTools,
+    LLMError,
+    build_llm_client,
+    build_worker_llm_client,
+)
 from .status import StatusBoard
 
 _log = logging.getLogger("obs_agents.main")
@@ -32,15 +37,27 @@ def build_system(config: Config, board: StatusBoard | None = None):
         _log.warning("LLM clients unavailable (%s); agents use heuristics", exc)
         coord_llm = worker_llm = None
 
+    # The agentic coordinator investigates with its own clients (separate
+    # sessions from the monitoring agents — they run on different threads).
+    tools = None
     if coord_llm is not None:
+        tools = InvestigationTools(
+            PrometheusClient(config.prometheus),
+            LokiClient(config.loki),
+            TempoClient(config.tempo),
+        )
         _log.info(
-            "AI agents enabled — workers: %s, coordinator: %s",
-            config.llm.worker_model, config.llm.model,
+            "AI agents enabled — workers: %s (effort=%s), coordinator: %s "
+            "(effort=%s, agentic tools=%d)",
+            config.llm.worker_model, config.llm.worker_effort,
+            config.llm.model, config.llm.effort, len(tools.schemas()),
         )
     else:
         _log.info("AI disabled; agents use threshold + count-based heuristics")
 
-    coordinator = CoordinatorAgent.start(llm_client=coord_llm, status_board=board)
+    coordinator = CoordinatorAgent.start(
+        llm_client=coord_llm, status_board=board, tools=tools
+    )
 
     metrics = MetricsAgent.start(
         coordinator, PrometheusClient(config.prometheus),
