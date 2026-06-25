@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  pull-requests: write  # needed to manage the image-ready label
+
 env:
   REGISTRY: simployertechdev.azurecr.io
   IMAGE_NAME: demo-app
@@ -24,15 +28,24 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Set image tag
-        id: tag
+      - name: Remove image-ready label
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: curl -s -o /dev/null -X DELETE -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/image-ready" || true
+
+      - name: Compute tags
+        id: tags
         run: |
+          FULL_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          SHORT_SHA="${FULL_SHA::7}"
+          R="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "tag=pr-${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            { echo "tags<<EOF"; echo "${R}:sha-${SHORT_SHA}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            { echo "tags<<EOF"; echo "${R}:${GITHUB_REF#refs/tags/v}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
           else
-            echo "tag=latest" >> $GITHUB_OUTPUT
+            { echo "tags<<EOF"; echo "${R}:latest"; echo "${R}:main-${SHORT_SHA}"; echo "${R}:sha-${SHORT_SHA}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push
@@ -40,4 +53,10 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Set image-ready label
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: curl -s -o /dev/null -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" -d '{"labels":["image-ready"]}'
