@@ -68,6 +68,15 @@ worker thread, so the investigation never stalls the coordinator's inbox.
 effort `high` for the harder, tool-using reasoning. Both tiers fall back to
 heuristics if no LLM is configured or a call fails.
 
+**Incident lifecycle.** Incidents open per entity, and **auto-resolve** once that
+entity's signals have been clear for `INCIDENT_RESOLVE_AFTER_S` (default 180s). A
+periodic sweep (every `INCIDENT_SWEEP_S`) checks each open incident against the
+last time its entity reported a genuine anomaly; stale ones move to a bounded
+resolved-history (shown on the dashboard and at `/status`), responders get an
+`incident_resolved` message, and a later recurrence opens a fresh incident.
+Incident state is in-memory (lost on restart) — durable persistence across
+restarts is the remaining lifecycle piece and is intentionally out of scope here.
+
 **Decision cache (optional).** The agentic triage is the priciest call in the
 system, so an optional Redis cache (`REDIS_URL`) stores each decision keyed by
 the incident's *shape* (entity + signal sources + severity hints). A recurring
@@ -167,6 +176,8 @@ Everything is env-var driven so one image is swappable per environment.
 | `LLM_MAX_INVESTIGATION_STEPS` | `4` | coordinator tool-use iterations per incident |
 | `LLM_MAX_TOKENS` | `8192` | coordinator max output tokens (tools + thinking) |
 | `LLM_TIMEOUT_S` | `45` | per-call timeout (agentic loop may take several) |
+| `INCIDENT_RESOLVE_AFTER_S` | `180` | auto-resolve after an entity's signals are clear this long |
+| `INCIDENT_SWEEP_S` | `30` | how often the coordinator checks for resolvable incidents |
 | `REDIS_URL` | — | enable the decision cache (e.g. `redis://redis:6379/0`); unset = no-op |
 | `CACHE_TTL_S` | `300` | cached-decision TTL |
 | `POLL_INTERVAL_S` | `30` | monitoring poll cadence |

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import string
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,9 @@ class CoordinatorAgent(pykka.ThreadingActor):
         status_board: StatusBoard | None = None,
         tools: Any = None,
         decision_cache: DecisionCache | None = None,
+        resolve_after_s: float = 180.0,
+        sweep_interval_s: float = 30.0,
+        history_limit: int = 50,
     ):
         super().__init__()
         self._window_s = correlation_window_s
@@ -62,12 +66,20 @@ class CoordinatorAgent(pykka.ThreadingActor):
         self._tools = tools
         self._cache = decision_cache or NoopCache()
         self._board = status_board
+        self._resolve_after_s = resolve_after_s
+        self._sweep_interval_s = sweep_interval_s
+        self._history_limit = history_limit
         self._recent: list[AgentAssessment] = []
         #: incidents keyed by entity (affected service/component)
         self._incidents: dict[str, IncidentReport] = {}
         self._incident_signals: dict[str, frozenset] = {}
         self._pending_triage: set[str] = set()
         self._fanned_out: dict[str, DecisionAction] = {}
+        #: last time each entity had a genuine anomaly reported — feeds resolution
+        self._last_signal_at: dict[str, float] = {}
+        #: bounded history of resolved incidents
+        self._resolved: list[IncidentReport] = []
+        self._sweep_timer: threading.Timer | None = None
         self._log = logging.getLogger("obs_agents.coordinator")
 
         if triage_executor is not None:
@@ -81,12 +93,28 @@ class CoordinatorAgent(pykka.ThreadingActor):
         if self._board is not None:
             self._board.register(self.actor_urn, "coordinator", "coordinator")
             self._board.set_state(self.actor_urn, "idle", "awaiting assessments")
+        self._schedule_sweep()
 
     def on_stop(self) -> None:
+        if self._sweep_timer is not None:
+            self._sweep_timer.cancel()
         if isinstance(self._executor, ThreadPoolExecutor):
             self._executor.shutdown(wait=False)
         if self._board is not None:
             self._board.unregister(self.actor_urn)
+
+    def _schedule_sweep(self) -> None:
+        self._sweep_timer = threading.Timer(
+            self._sweep_interval_s, lambda: self._tell_if_alive({"sweep": True})
+        )
+        self._sweep_timer.daemon = True
+        self._sweep_timer.start()
+
+    def _tell_if_alive(self, message: dict[str, Any]) -> None:
+        try:
+            self.actor_ref.tell(message)
+        except pykka.ActorDeadError:
+            pass
 
     def _publish(self, state: str, detail: str = "") -> None:
         if self._board is not None:
@@ -101,8 +129,14 @@ class CoordinatorAgent(pykka.ThreadingActor):
         if "triage_result" in message:
             self._handle_triage_result(message["triage_result"])
             return None
+        if message.get("sweep"):
+            self._sweep()
+            self._schedule_sweep()
+            return None
         if message.get("query") == "incidents":
             return [inc.to_dict() for inc in self._incidents.values()]
+        if message.get("query") == "incident_history":
+            return [inc.to_dict() for inc in self._resolved]
         if message.get("query") == "open_incident_count":
             return len(self._incidents)
         return None
@@ -148,8 +182,11 @@ class CoordinatorAgent(pykka.ThreadingActor):
         return groups
 
     def _correlate(self) -> None:
+        now = time.time()
         for entity, group in self._groups().items():
             sources = {a.source for a in group}
+            # Liveness: this entity is currently anomalous — feeds resolution.
+            self._last_signal_at[entity] = now
             if len(sources) < 2:
                 continue  # not enough distinct sources implicating this entity
             contributing = tuple(sorted(sources))
@@ -266,6 +303,35 @@ class CoordinatorAgent(pykka.ThreadingActor):
             "decided", f"{entity}: {decision.action.value} ({decision.severity.value}, {source})"
         )
         self._maybe_fan_out(report, decision.action)
+
+    # -- resolution / lifecycle ------------------------------------------
+    def _sweep(self) -> None:
+        """Auto-resolve incidents whose signals have been clear long enough."""
+        self._prune()
+        now = time.time()
+        for entity in list(self._incidents):
+            last = self._last_signal_at.get(entity, self._incidents[entity].opened_at)
+            if now - last >= self._resolve_after_s:
+                self._resolve_incident(entity, now)
+
+    def _resolve_incident(self, entity: str, now: float) -> None:
+        report = self._incidents.pop(entity)
+        resolved = replace(report, status="resolved", resolved_at=now, updated_at=now)
+        self._resolved.append(resolved)
+        if len(self._resolved) > self._history_limit:
+            self._resolved = self._resolved[-self._history_limit:]
+        # Clean per-incident state so a later recurrence opens fresh.
+        self._incident_signals.pop(entity, None)
+        self._pending_triage.discard(entity)
+        self._fanned_out.pop(entity, None)
+        self._last_signal_at.pop(entity, None)
+        self._log.warning("incident on %s resolved (signals clear)", entity)
+        self._publish("resolved", f"{entity} resolved")
+        for responder in self._responders:
+            try:
+                responder.tell({"incident_resolved": resolved})
+            except pykka.ActorDeadError:
+                self._log.warning("responder %s is dead", responder)
 
     # -- heuristic fallback ---------------------------------------------
     def _heuristic_decision(self, entity: str, sources: set[str]) -> Decision:

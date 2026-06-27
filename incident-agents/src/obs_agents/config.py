@@ -104,6 +104,10 @@ class Config:
     thresholds: Thresholds = field(default_factory=Thresholds)
     llm: LLMConfig = field(default_factory=LLMConfig)
 
+    # Incident lifecycle: auto-resolve after signals have been clear this long.
+    incident_resolve_after_s: float = 180.0
+    incident_sweep_s: float = 30.0
+
     # Optional Redis decision cache (no-op when redis_url is unset).
     redis_url: str | None = None
     cache_ttl_s: float = 300.0
@@ -145,6 +149,8 @@ class Config:
                 max_error_traces=_env_int("THRESHOLD_ERROR_TRACES", 5),
             ),
             llm=LLMConfig.from_env(),
+            incident_resolve_after_s=_env_float("INCIDENT_RESOLVE_AFTER_S", 180.0),
+            incident_sweep_s=_env_float("INCIDENT_SWEEP_S", 30.0),
             redis_url=os.getenv("REDIS_URL"),
             cache_ttl_s=_env_float("CACHE_TTL_S", 300.0),
             health_host=os.getenv("HEALTH_HOST", "0.0.0.0"),

@@ -65,6 +65,12 @@ class HealthState:
         except pykka.Timeout:
             return []
 
+    def resolved(self) -> list[dict]:
+        try:
+            return self._coordinator.ask({"query": "incident_history"}, timeout=2) or []
+        except pykka.Timeout:
+            return []
+
 
 def _make_handler(state: HealthState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -85,6 +91,7 @@ def _make_handler(state: HealthState) -> type[BaseHTTPRequestHandler]:
                 self._send(200, {
                     "agents": state.agents(),
                     "incidents": state.incidents(),
+                    "resolved": state.resolved(),
                     "ready": state.is_ready(),
                 })
             elif self.path == "/healthz":
@@ -143,6 +150,8 @@ _DASHBOARD_HTML = b"""<!DOCTYPE html>
   <div class="grid" id="agents"></div>
   <h2>Open incidents</h2>
   <div id="incidents"><span class="muted">none</span></div>
+  <h2>Recently resolved</h2>
+  <div id="resolved"><span class="muted">none</span></div>
 </main>
 <script>
 const KIND = {metrics:'\\u{1F4C8}', logs:'\\u{1F4DC}', traces:'\\u{1F517}', coordinator:'\\u{1F9ED}'};
@@ -176,6 +185,11 @@ async function tick(){
       <div class="h">${SEV[i.severity]||''} ${esc(i.incident_id)} &middot; ${esc(i.recommended_action)}
         <span class="muted src">(${(i.contributing_alerts||[]).join(', ')} \\u00b7 ${esc(i.decision_source)})</span></div>
       <div class="ex">${esc(i.explanation||i.summary)}</div>
+    </div>`).join('') || '<span class="muted">none</span>';
+
+  document.getElementById('resolved').innerHTML = (d.resolved||[]).slice(-8).reverse().map(i =>
+    `<div class="inc" style="border-left-color:#3a7d5a;opacity:.7">
+      <div class="h">\\u2705 ${esc(i.incident_id)} <span class="muted src">resolved (was ${esc(i.severity)}/${esc(i.recommended_action)})</span></div>
     </div>`).join('') || '<span class="muted">none</span>';
 }
 tick(); setInterval(tick, 1000);

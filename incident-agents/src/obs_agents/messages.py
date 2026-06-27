@@ -121,9 +121,11 @@ class IncidentReport:
     recommended_action: str = "investigate"
     analysis: str = ""
     explanation: str = ""
-    decision_source: str = "heuristic"  # "llm" | "heuristic"
+    decision_source: str = "heuristic"  # "llm" | "cache" | "heuristic"
+    status: str = "open"  # "open" | "resolved"
     opened_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
+    resolved_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

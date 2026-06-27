@@ -59,6 +59,8 @@ def build_system(config: Config, board: StatusBoard | None = None):
     coordinator = CoordinatorAgent.start(
         llm_client=coord_llm, status_board=board, tools=tools,
         decision_cache=build_decision_cache(config),
+        resolve_after_s=config.incident_resolve_after_s,
+        sweep_interval_s=config.incident_sweep_s,
     )
 
     metrics = MetricsAgent.start(
